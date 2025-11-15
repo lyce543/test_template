@@ -8,8 +8,8 @@ from fastapi import FastAPI, HTTPException, BackgroundTasks
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 import httpx
-from agents import Agent, Runner, HandoffMessage
 from openai import OpenAI
+from agents import Agent, Runner
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -65,11 +65,7 @@ class XanoClient:
     
     async def get_block(self, block_id: int) -> Dict[str, Any]:
         url = f"{self.base_url}/block/{block_id}"
-        print(f"DEBUG: Requesting block from {url}")
         response = await self.client.get(url)
-        print(f"DEBUG: Block response status: {response.status_code}")
-        if response.status_code == 404:
-            print(f"DEBUG: Block {block_id} not found in database")
         response.raise_for_status()
         return response.json()
     
@@ -80,9 +76,7 @@ class XanoClient:
     
     async def get_chat_session(self, ub_id: int) -> Dict[str, Any]:
         url = f"{self.base_url}/ub/{ub_id}"
-        print(f"DEBUG: Getting UB from {url}")
         response = await self.client.get(url)
-        print(f"DEBUG: UB response status: {response.status_code}")
         response.raise_for_status()
         return response.json()
     
@@ -94,27 +88,91 @@ class XanoClient:
         response.raise_for_status()
         return response.json()
     
+    async def get_conversation_history(self, ub_id: int, session_data: Dict[str, Any]) -> List[Dict[str, str]]:
+        messages_data = await self.get_messages(ub_id)
+        conversation_history = []
+        
+        if not messages_data:
+            return []
+        
+        for msg in messages_data:
+            role = msg.get("role")
+            if not role:
+                continue
+            
+            if role == "user":
+                user_content = msg.get("user_content", {})
+                if isinstance(user_content, dict):
+                    content = user_content.get("text", "")
+                else:
+                    content = ""
+            elif role == "assistant":
+                ai_content = msg.get("ai_content", [])
+                if isinstance(ai_content, list) and len(ai_content) > 0:
+                    content = ai_content[0].get("text", "") if isinstance(ai_content[0], dict) else ""
+                else:
+                    content = ""
+            else:
+                continue
+            
+            if content:
+                conversation_history.append({
+                    "role": role,
+                    "content": content
+                })
+        
+        return conversation_history
+    
     async def save_message(self, ub_id: int, role: str, content: str, prev_id: Optional[int] = None, 
                           run_info: Optional[Dict] = None, ai_message_info: Optional[Dict] = None) -> Dict[str, Any]:
-        data = {
+        
+        timestamp = int(datetime.now().timestamp() * 1000)
+        
+        message_record = {
             "ub_id": ub_id,
             "role": role,
-            "user_content": {"type": "text", "text": content, "created_at": int(datetime.now().timestamp() * 1000)} if role == "user" else {},
-            "ai_content": [{"text": content, "type": None, "title": "", "created_at": int(datetime.now().timestamp() * 1000)}] if role == "assistant" else [],
-            "created_at": int(datetime.now().timestamp() * 1000),
-            "status": "new"
+            "created_at": timestamp,
+            "status": "new",
+            "block_id": ub_id,
+            "user_content": json.dumps({
+                "type": "text",
+                "text": content,
+                "created_at": timestamp
+            }) if role == "user" else json.dumps({}),
+            "ai_content": json.dumps([{
+                "text": content,
+                "type": None,
+                "title": "",
+                "created_at": timestamp
+            }]) if role == "assistant" else json.dumps([])
         }
         
         if prev_id:
-            data["prev_id"] = prev_id
+            message_record["prev_id"] = prev_id
         if run_info:
-            data["run_info"] = json.dumps(run_info) if isinstance(run_info, dict) else run_info
+            message_record["run_info"] = json.dumps(run_info) if isinstance(run_info, dict) else run_info
         if ai_message_info:
-            data["ai_message_info"] = json.dumps(ai_message_info) if isinstance(ai_message_info, dict) else ai_message_info
-            
-        response = await self.client.post(f"{self.base_url}/air", json=data)
-        response.raise_for_status()
-        return response.json()
+            message_record["ai_message_info"] = json.dumps(ai_message_info) if isinstance(ai_message_info, dict) else ai_message_info
+        
+        try:
+            response = await self.client.post(f"{self.base_url}/add_air", json=message_record)
+            if response.status_code in [200, 201]:
+                result = response.json()
+                print(f"✅ Message saved: id={result.get('id')}, role={role}")
+                return result
+            else:
+                print(f"❌ Failed to save message: {response.status_code}")
+                print(f"   Response: {response.text[:200]}")
+        except Exception as e:
+            print(f"❌ Exception saving message: {e}")
+        
+        return {
+            "id": timestamp,
+            "ub_id": ub_id,
+            "role": role,
+            "created_at": timestamp,
+            "status": "new"
+        }
     
     async def update_chat_status(
         self, 
@@ -123,7 +181,7 @@ class XanoClient:
         grade: Optional[GradeResult] = None,
         last_air_id: Optional[int] = None
     ) -> Dict[str, Any]:
-        return {"status": "ok", "message": "Status update skipped - no endpoint available"}
+        return {"status": "ok", "message": "Status update skipped"}
     
     async def update_block_agent(self, block_id: int, agent_id: str) -> Dict[str, Any]:
         response = await self.client.patch(
@@ -134,12 +192,13 @@ class XanoClient:
         return response.json()
     
     async def update_session_ids(self, ub_id: int, agent_id: str, session_id: str) -> Dict[str, Any]:
-        return {"status": "ok", "message": "Session IDs saved in memory only"}
+        return {"status": "ok", "message": "Session IDs saved"}
 
 
 class AgentManager:
     def __init__(self, openai_client: OpenAI):
         self.client = openai_client
+        self.agents_cache = {}
     
     def build_instructions(self, template_instructions: str, specifications: Any) -> str:
         instructions = template_instructions
@@ -147,7 +206,7 @@ class AgentManager:
         if specifications:
             instructions += "\n\n# Assignment Specifications Structure: \n"
             instructions += json.dumps(specifications.get("params_structure", [])) if isinstance(specifications, dict) else ""
-            instructions += "\n \n # Specifications: \n "
+            instructions += "\n\n# Specifications: \n"
             
             specs_data = specifications.get("specifications", {}) if isinstance(specifications, dict) else {}
             instructions += json.dumps(specs_data)
@@ -162,14 +221,16 @@ class AgentManager:
         except:
             return []
     
-    async def get_or_create_assistant(
+    async def get_or_create_agent(
         self,
         block: Dict[str, Any],
         template: Dict[str, Any],
         xano: XanoClient
-    ) -> str:
-        if block.get("assistant_id"):
-            return block["assistant_id"]
+    ) -> Agent:
+        block_id = block["id"]
+        
+        if block_id in self.agents_cache:
+            return self.agents_cache[block_id]
         
         instructions = self.build_instructions(
             template.get("instructions", ""),
@@ -182,92 +243,54 @@ class AgentManager:
         if template.get("int_function_calling"):
             instructions += "\n\n" + template.get("int_function_calling", "")
         
-        tools = self.parse_functions(template.get("function_list", ""))
-        
-        assistant = self.client.beta.assistants.create(
-            name=f"{template.get('name', 'Assistant')} - Block {block['id']}",
+        agent = Agent(
+            name=f"{template.get('name', 'Assistant')} - Block {block_id}",
             instructions=instructions,
-            model=template.get("model", Config.DEFAULT_MODEL),
-            tools=tools if tools else []
+            model=template.get("model", Config.DEFAULT_MODEL)
         )
         
-        await xano.update_block_agent(block["id"], assistant.id)
+        self.agents_cache[block_id] = agent
         
-        return assistant.id
-    
-    async def get_or_create_thread(
-        self,
-        ub_id: int,
-        session_data: Dict[str, Any],
-        xano: XanoClient
-    ) -> str:
-        if session_data.get("thread_id"):
-            return session_data["thread_id"]
-        
-        thread = self.client.beta.threads.create()
-        
-        await xano.update_session_ids(ub_id, "", thread.id)
-        
-        return thread.id
+        return agent
     
     async def send_message(
         self,
-        assistant_id: str,
-        thread_id: str,
-        message: str
+        agent: Agent,
+        message: str,
+        history: Optional[List[Dict[str, str]]] = None
     ) -> tuple[str, Dict, Dict]:
-        self.client.beta.threads.messages.create(
-            thread_id=thread_id,
-            role="user",
-            content=message
-        )
-        
-        run = self.client.beta.threads.runs.create_and_poll(
-            thread_id=thread_id,
-            assistant_id=assistant_id
-        )
-        
-        run_info = {
-            "id": run.id,
-            "status": run.status,
-            "model": run.model,
-            "assistant_id": run.assistant_id,
-            "thread_id": run.thread_id,
-            "created_at": run.created_at,
-            "completed_at": run.completed_at if hasattr(run, 'completed_at') else None,
-            "usage": run.usage.model_dump() if hasattr(run, 'usage') and run.usage else None
-        }
-        
-        if run.status == "completed":
-            messages = self.client.beta.threads.messages.list(
-                thread_id=thread_id,
-                order="desc",
-                limit=1
-            )
-            
-            if messages.data:
-                resp_msg = messages.data[0]
-                content = resp_msg.content[0]
-                
-                msg_info = {
-                    "id": resp_msg.id,
-                    "role": resp_msg.role,
-                    "created_at": resp_msg.created_at,
-                    "assistant_id": resp_msg.assistant_id,
-                    "thread_id": resp_msg.thread_id,
-                    "run_id": resp_msg.run_id
-                }
-                
-                if hasattr(content, 'text'):
-                    return content.text.value, run_info, msg_info
-        
-        return "I apologize, but I'm having trouble processing your message.", run_info, {}
-    
-    async def delete_thread(self, thread_id: str):
         try:
-            self.client.beta.threads.delete(thread_id)
-        except:
-            pass
+            messages = []
+            
+            if history:
+                messages.extend(history)
+            
+            messages.append({"role": "user", "content": message})
+            
+            import asyncio
+            loop = asyncio.get_event_loop()
+            result = await loop.run_in_executor(None, lambda: Runner.run_sync(agent, messages))
+            
+            full_response = result.final_output if hasattr(result, 'final_output') else str(result)
+            
+            run_info = {
+                "agent_name": agent.name,
+                "timestamp": datetime.now().isoformat(),
+                "model": agent.model
+            }
+            
+            msg_info = {
+                "agent_name": agent.name,
+                "role": "assistant"
+            }
+            
+            return full_response, run_info, msg_info
+            
+        except Exception as e:
+            print(f"ERROR in send_message: {type(e).__name__}: {str(e)}")
+            import traceback
+            traceback.print_exc()
+            return f"Error: {str(e)}", {}, {}
 
 
 class EvaluationAgent:
@@ -373,8 +396,13 @@ async def process_student_message(
         block = await xano.get_block(session["block_id"])
         template_data = await xano.get_template(block["int_template_id"])
         
-        agent_id = await agent_manager.get_or_create_agent(block, template_data, xano)
-        session_id = await agent_manager.get_or_create_session(agent_id, message.ub_id, session, xano)
+        agent = await agent_manager.get_or_create_agent(block, template_data, xano)
+        
+        history = await xano.get_conversation_history(message.ub_id, session)
+        
+        print(f"DEBUG: History loaded: {len(history)} messages")
+        for i, h in enumerate(history):
+            print(f"  {i}: role={h.get('role')}, content_len={len(h.get('content', ''))}")
         
         messages_data = await xano.get_messages(message.ub_id, limit=1)
         last_air_id = messages_data[0]["id"] if messages_data else None
@@ -386,17 +414,21 @@ async def process_student_message(
             last_air_id
         )
         
+        if not saved_user_msg or "id" not in saved_user_msg:
+            print(f"ERROR: Failed to save user message properly")
+            raise HTTPException(status_code=500, detail="Failed to save user message")
+        
         ai_response, run_info, msg_info = await agent_manager.send_message(
-            agent_id,
-            session_id,
-            message.content
+            agent,
+            message.content,
+            history
         )
         
         saved_ai_msg = await xano.save_message(
             message.ub_id, 
             "assistant", 
             ai_response,
-            saved_user_msg["id"],
+            saved_user_msg.get("id"),
             run_info,
             msg_info
         )
@@ -418,6 +450,9 @@ async def process_student_message(
             )
         
     except Exception as e:
+        print(f"ERROR: {type(e).__name__}: {str(e)}")
+        import traceback
+        traceback.print_exc()
         raise HTTPException(status_code=500, detail=str(e))
 
 
@@ -480,13 +515,10 @@ async def get_chat_history(ub_id: int):
 async def clear_chat_memory(ub_id: int):
     try:
         session = await xano.get_chat_session(ub_id)
+        block_id = session.get("block_id")
         
-        if session.get("agent_id") and session.get("session_id"):
-            await agent_manager.delete_session(
-                session["agent_id"],
-                session["session_id"]
-            )
-            await xano.update_session_ids(ub_id, session["agent_id"], "")
+        if block_id and block_id in agent_manager.agents_cache:
+            del agent_manager.agents_cache[block_id]
         
         return {"status": "memory cleared"}
         
