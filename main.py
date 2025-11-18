@@ -9,7 +9,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 import httpx
 from openai import OpenAI
-from agents import Agent, Runner
+from agents import Agent, Runner, function_tool
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -88,34 +88,79 @@ class XanoClient:
         response.raise_for_status()
         return response.json()
     
+    def parse_message_content(self, msg: Dict[str, Any]) -> tuple[str, str]:
+        user_content_raw = msg.get("user_content", "{}")
+        ai_content_raw = msg.get("ai_content", "[]")
+        
+        try:
+            if isinstance(user_content_raw, str):
+                user_content = json.loads(user_content_raw)
+            else:
+                user_content = user_content_raw
+        except:
+            user_content = {}
+        
+        try:
+            if isinstance(ai_content_raw, str):
+                ai_content = json.loads(ai_content_raw)
+            else:
+                ai_content = ai_content_raw
+        except:
+            ai_content = []
+        
+        user_text = ""
+        if isinstance(user_content, dict) and user_content.get("text"):
+            user_text = user_content.get("text", "")
+        
+        ai_text = ""
+        if isinstance(ai_content, list) and len(ai_content) > 0:
+            if isinstance(ai_content[0], dict):
+                ai_text = ai_content[0].get("text", "")
+        
+        if user_text:
+            return "user", user_text
+        elif ai_text:
+            return "assistant", ai_text
+        else:
+            return "unknown", ""
+    
     async def get_conversation_history(self, ub_id: int, session_data: Dict[str, Any]) -> List[Dict[str, str]]:
         messages_data = await self.get_messages(ub_id)
-        conversation_history = []
         
         if not messages_data:
             return []
         
-        for msg in messages_data:
-            role = msg.get("role")
-            if not role:
-                continue
+        messages_dict = {msg["id"]: msg for msg in messages_data}
+        conversation_history = []
+        
+        last_air_id = session_data.get("last_air_id")
+        
+        if not last_air_id:
+            sorted_messages = sorted(messages_data, key=lambda x: x.get("created_at", 0))
             
-            if role == "user":
-                user_content = msg.get("user_content", {})
-                if isinstance(user_content, dict):
-                    content = user_content.get("text", "")
-                else:
-                    content = ""
-            elif role == "assistant":
-                ai_content = msg.get("ai_content", [])
-                if isinstance(ai_content, list) and len(ai_content) > 0:
-                    content = ai_content[0].get("text", "") if isinstance(ai_content[0], dict) else ""
-                else:
-                    content = ""
-            else:
-                continue
+            for msg in sorted_messages:
+                role, content = self.parse_message_content(msg)
+                
+                if role in ["user", "assistant"] and content:
+                    conversation_history.append({
+                        "role": role,
+                        "content": content
+                    })
             
-            if content:
+            return conversation_history
+        
+        current_id = last_air_id
+        messages_chain = []
+        
+        while current_id and current_id in messages_dict:
+            msg = messages_dict[current_id]
+            messages_chain.insert(0, msg)
+            current_id = msg.get("prev_id")
+        
+        for msg in messages_chain:
+            role, content = self.parse_message_content(msg)
+            
+            if role in ["user", "assistant"] and content:
                 conversation_history.append({
                     "role": role,
                     "content": content
@@ -134,18 +179,30 @@ class XanoClient:
             "created_at": timestamp,
             "status": "new",
             "block_id": ub_id,
-            "user_content": json.dumps({
+        }
+        
+        if role == "user":
+            message_record["user_content"] = json.dumps({
                 "type": "text",
                 "text": content,
-                "created_at": timestamp
-            }) if role == "user" else json.dumps({}),
-            "ai_content": json.dumps([{
+                "file_url": "",
+                "created_at": timestamp,
+                "error_message": "",
+                "error_code": "",
+                "file": None,
+                "images": None
+            })
+            message_record["ai_content"] = json.dumps([])
+        else:
+            message_record["user_content"] = json.dumps({})
+            message_record["ai_content"] = json.dumps([{
                 "text": content,
-                "type": None,
                 "title": "",
-                "created_at": timestamp
-            }]) if role == "assistant" else json.dumps([])
-        }
+                "created_at": timestamp,
+                "type": None,
+                "grade": None,
+                "additional": ""
+            }])
         
         if prev_id:
             message_record["prev_id"] = prev_id
@@ -169,7 +226,6 @@ class XanoClient:
         return {
             "id": timestamp,
             "ub_id": ub_id,
-            "role": role,
             "created_at": timestamp,
             "status": "new"
         }
@@ -181,7 +237,25 @@ class XanoClient:
         grade: Optional[GradeResult] = None,
         last_air_id: Optional[int] = None
     ) -> Dict[str, Any]:
-        return {"status": "ok", "message": "Status update skipped"}
+        update_data = {"status": status.value}
+        if grade:
+            update_data["grade"] = grade.value
+        if last_air_id:
+            update_data["last_air_id"] = last_air_id
+        
+        try:
+            response = await self.client.post(
+                f"{self.base_url}/update_ub",
+                json={"ub_id": ub_id, **update_data}
+            )
+            if response.status_code in [200, 201]:
+                return response.json()
+            else:
+                print(f"⚠️  Failed to update chat status: {response.status_code} - {response.text[:100]}")
+                return {"status": "ok", "message": "Status update failed but continuing"}
+        except Exception as e:
+            print(f"⚠️  Exception updating chat status: {e}")
+            return {"status": "ok", "message": "Status update failed but continuing"}
     
     async def update_block_agent(self, block_id: int, agent_id: str) -> Dict[str, Any]:
         response = await self.client.patch(
@@ -205,11 +279,11 @@ class AgentManager:
         
         if specifications:
             instructions += "\n\n# Assignment Specifications Structure: \n"
-            instructions += json.dumps(specifications.get("params_structure", [])) if isinstance(specifications, dict) else ""
+            instructions += json.dumps(specifications.get("params_structure", []), ensure_ascii=False) if isinstance(specifications, dict) else ""
             instructions += "\n\n# Specifications: \n"
             
             specs_data = specifications.get("specifications", {}) if isinstance(specifications, dict) else {}
-            instructions += json.dumps(specs_data)
+            instructions += json.dumps(specs_data, ensure_ascii=False)
         
         return instructions
     
@@ -220,6 +294,42 @@ class AgentManager:
             return json.loads(function_list)
         except:
             return []
+    
+    def parse_tools(self, function_list: List[Dict]) -> List[callable]:
+        if not function_list:
+            return []
+        
+        tools = []
+        
+        for func in function_list:
+            if func.get("name") == "status_grade":
+                @function_tool
+                def status_grade(status: str, grade: str = "") -> dict:
+                    """Update the current chat's status and assign a pass/fail grade.
+                    
+                    Args:
+                        status: The current status (idle, started, finished, blocked, test_finished)
+                        grade: The grade (pass, fail, or empty string)
+                    """
+                    return {"status": status, "grade": grade, "success": True}
+                
+                tools.append(status_grade)
+            
+            elif func.get("name") == "random_numbers":
+                @function_tool
+                def random_numbers(array_length: int) -> dict:
+                    """Get an array of N random numbers.
+                    
+                    Args:
+                        array_length: Length of the array
+                    """
+                    import random
+                    numbers = [random.randint(0, 1000000) for _ in range(array_length)]
+                    return {"numbers": numbers, "success": True}
+                
+                tools.append(random_numbers)
+        
+        return tools
     
     async def get_or_create_agent(
         self,
@@ -243,10 +353,15 @@ class AgentManager:
         if template.get("int_function_calling"):
             instructions += "\n\n" + template.get("int_function_calling", "")
         
+        tools = self.parse_tools(template.get("function_list", []))
+        
+        print(f"🔧 Creating agent with {len(tools)} tools: {[t.__name__ if hasattr(t, '__name__') else 'unknown' for t in tools]}")
+        
         agent = Agent(
             name=f"{template.get('name', 'Assistant')} - Block {block_id}",
             instructions=instructions,
-            model=template.get("model", Config.DEFAULT_MODEL)
+            model=template.get("model", Config.DEFAULT_MODEL),
+            tools=tools if tools else []
         )
         
         self.agents_cache[block_id] = agent
@@ -257,8 +372,10 @@ class AgentManager:
         self,
         agent: Agent,
         message: str,
-        history: Optional[List[Dict[str, str]]] = None
-    ) -> tuple[str, Dict, Dict]:
+        history: Optional[List[Dict[str, str]]] = None,
+        ub_id: Optional[int] = None,
+        xano: Optional[XanoClient] = None
+    ) -> tuple[str, Dict, Dict, Optional[Dict]]:
         try:
             messages = []
             
@@ -273,10 +390,26 @@ class AgentManager:
             
             full_response = result.final_output if hasattr(result, 'final_output') else str(result)
             
+            print(f"🤖 Agent response attributes: {[attr for attr in dir(result) if not attr.startswith('_')]}")
+            print(f"🤖 New items count: {len(result.new_items) if hasattr(result, 'new_items') else 0}")
+            
+            function_calls = None
+            if hasattr(result, 'new_items') and result.new_items:
+                for item in result.new_items:
+                    item_type = type(item).__name__
+                    print(f"   Item type: {item_type}")
+                    if item_type == "ToolCallOutputItem":
+                        print(f"   🔍 Item attributes: {[attr for attr in dir(item) if not attr.startswith('_')]}")
+                        if hasattr(item, 'tool_name'):
+                            print(f"   🎯 Tool called: {item.tool_name}")
+                
+                function_calls = await self.handle_tool_results(result.new_items, ub_id, xano)
+            
             run_info = {
                 "agent_name": agent.name,
                 "timestamp": datetime.now().isoformat(),
-                "model": agent.model
+                "model": agent.model,
+                "function_calls": function_calls
             }
             
             msg_info = {
@@ -284,13 +417,70 @@ class AgentManager:
                 "role": "assistant"
             }
             
-            return full_response, run_info, msg_info
+            return full_response, run_info, msg_info, function_calls
             
         except Exception as e:
             print(f"ERROR in send_message: {type(e).__name__}: {str(e)}")
             import traceback
             traceback.print_exc()
-            return f"Error: {str(e)}", {}, {}
+            return f"Error: {str(e)}", {}, {}, None
+    
+    async def handle_tool_results(
+        self,
+        items: List[Any],
+        ub_id: Optional[int],
+        xano: Optional[XanoClient]
+    ) -> Dict[str, Any]:
+        results = {}
+        
+        for item in items:
+            item_type = type(item).__name__
+            
+            if item_type == "ToolCallOutputItem":
+                if not hasattr(item, 'tool_name'):
+                    continue
+                
+                func_name = item.tool_name
+                result_value = item.output if hasattr(item, 'output') else {}
+                
+                print(f"🎯 Tool called: {func_name}")
+                print(f"   Output: {result_value}")
+                
+                if func_name == "status_grade":
+                    try:
+                        if isinstance(result_value, dict):
+                            status = result_value.get("status")
+                            grade = result_value.get("grade", "")
+                        else:
+                            status = None
+                            grade = ""
+                        
+                        print(f"🎯 Function call: status_grade(status={status}, grade={grade})")
+                        
+                        if ub_id and xano and status:
+                            chat_status = ChatStatus(status) if status in [s.value for s in ChatStatus] else ChatStatus.FINISHED
+                            grade_result = GradeResult(grade) if grade and grade in [g.value for g in GradeResult] else None
+                            
+                            await xano.update_chat_status(ub_id, chat_status, grade_result)
+                        
+                        results[func_name] = {
+                            "status": status,
+                            "grade": grade,
+                            "success": True
+                        }
+                    except Exception as e:
+                        print(f"❌ Error handling status_grade: {e}")
+                        results[func_name] = {"success": False, "error": str(e)}
+                
+                elif func_name == "random_numbers":
+                    try:
+                        print(f"🎲 Function call: random_numbers -> {result_value}")
+                        results[func_name] = result_value
+                    except Exception as e:
+                        print(f"❌ Error handling random_numbers: {e}")
+                        results[func_name] = {"success": False, "error": str(e)}
+        
+        return results if results else None
 
 
 class EvaluationAgent:
@@ -402,7 +592,7 @@ async def process_student_message(
         
         print(f"DEBUG: History loaded: {len(history)} messages")
         for i, h in enumerate(history):
-            print(f"  {i}: role={h.get('role')}, content_len={len(h.get('content', ''))}")
+            print(f"  {i}: role={h.get('role')}, content={h.get('content')[:50]}...")
         
         messages_data = await xano.get_messages(message.ub_id, limit=1)
         last_air_id = messages_data[0]["id"] if messages_data else None
@@ -418,10 +608,12 @@ async def process_student_message(
             print(f"ERROR: Failed to save user message properly")
             raise HTTPException(status_code=500, detail="Failed to save user message")
         
-        ai_response, run_info, msg_info = await agent_manager.send_message(
+        ai_response, run_info, msg_info, function_calls = await agent_manager.send_message(
             agent,
             message.content,
-            history
+            history,
+            message.ub_id,
+            xano
         )
         
         saved_ai_msg = await xano.save_message(
@@ -433,11 +625,12 @@ async def process_student_message(
             msg_info
         )
         
-        await xano.update_chat_status(
-            message.ub_id,
-            ChatStatus.STARTED,
-            last_air_id=saved_ai_msg["id"]
-        )
+        if not function_calls or "status_grade" not in function_calls:
+            await xano.update_chat_status(
+                message.ub_id,
+                ChatStatus.STARTED,
+                last_air_id=saved_ai_msg["id"]
+            )
         
         try:
             response_json = json.loads(ai_response)
@@ -461,29 +654,14 @@ async def evaluate_chat(ub_id: int):
     try:
         session = await xano.get_chat_session(ub_id)
         block = await xano.get_block(session["block_id"])
-        eval_template_data = await xano.get_template(block["eval_template_id"])
         
-        messages_data = await xano.get_messages(ub_id)
-        conversation_history = []
+        eval_template_id = block.get("eval_template_id")
+        if not eval_template_id:
+            raise HTTPException(status_code=400, detail="No evaluation template configured for this block")
         
-        messages_dict = {msg["id"]: msg for msg in messages_data}
-        current_id = session.get("last_air_id")
+        eval_template_data = await xano.get_template(eval_template_id)
         
-        while current_id and current_id in messages_dict:
-            msg = messages_dict[current_id]
-            
-            if msg["role"] == "user":
-                content = msg.get("user_content", {}).get("text", "")
-            else:
-                ai_content = msg.get("ai_content", [])
-                content = ai_content[0].get("text", "") if ai_content else ""
-            
-            conversation_history.insert(0, {
-                "role": msg["role"],
-                "content": content
-            })
-            
-            current_id = msg.get("prev_id")
+        conversation_history = await xano.get_conversation_history(ub_id, session)
         
         eval_agent = EvaluationAgent(openai_client)
         evaluation = await eval_agent.evaluate_chat(
@@ -496,16 +674,35 @@ async def evaluate_chat(ub_id: int):
         return evaluation
         
     except Exception as e:
+        print(f"ERROR in evaluate_chat: {type(e).__name__}: {str(e)}")
+        import traceback
+        traceback.print_exc()
         raise HTTPException(status_code=500, detail=str(e))
 
 
 @app.get("/chat/{ub_id}/history")
 async def get_chat_history(ub_id: int):
     try:
+        session = await xano.get_chat_session(ub_id)
         messages = await xano.get_messages(ub_id)
+        
+        parsed_messages = []
+        for msg in messages:
+            role, content = xano.parse_message_content(msg)
+            parsed_messages.append({
+                "id": msg.get("id"),
+                "role": role,
+                "content": content,
+                "created_at": msg.get("created_at"),
+                "prev_id": msg.get("prev_id"),
+                "user_content_raw": msg.get("user_content"),
+                "ai_content_raw": msg.get("ai_content")
+            })
+        
         return {
-            "messages": messages,
-            "count": len(messages)
+            "messages": parsed_messages,
+            "count": len(parsed_messages),
+            "last_air_id": session.get("last_air_id")
         }
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
