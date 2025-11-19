@@ -28,9 +28,6 @@ class ChatStatus(str, Enum):
     STARTED = "started"
     FINISHED = "finished"
     BLOCKED = "blocked"
-    # TEST_FINISHED може не підтримуватись в Xano - перевірте базу даних
-    # Якщо підтримується, розкоментуйте:
-    # TEST_FINISHED = "test_finished"
 
 
 class GradeResult(str, Enum):
@@ -90,60 +87,19 @@ class XanoClient:
         response.raise_for_status()
         return response.json()
     
-    def parse_message_content(self, msg: Dict[str, Any]) -> tuple[str, str]:
-        user_content_raw = msg.get("user_content", "{}")
-        ai_content_raw = msg.get("ai_content", "[]")
-        
-        try:
-            if isinstance(user_content_raw, str):
-                user_content = json.loads(user_content_raw)
-            else:
-                user_content = user_content_raw
-        except:
-            user_content = {}
-        
-        try:
-            if isinstance(ai_content_raw, str):
-                ai_content = json.loads(ai_content_raw)
-            else:
-                ai_content = ai_content_raw
-        except:
-            ai_content = []
-        
-        user_text = ""
-        if isinstance(user_content, dict) and user_content.get("text"):
-            user_text = user_content.get("text", "")
-        
-        ai_text = ""
-        if isinstance(ai_content, list) and len(ai_content) > 0:
-            if isinstance(ai_content[0], dict):
-                ai_text = ai_content[0].get("text", "")
-        
-        if user_text:
-            return "user", user_text
-        elif ai_text:
-            return "assistant", ai_text
-        else:
-            return "unknown", ""
-    
     async def get_conversation_history(self, ub_id: int, session_data: Dict[str, Any]) -> List[Dict[str, str]]:
-        """Отримує повну історію розмови для агента"""
         messages_data = await self.get_messages(ub_id)
         
         if not messages_data:
             return []
         
-        # Створюємо словник для швидкого пошуку
         messages_dict = {msg["id"]: msg for msg in messages_data}
         
-        # Знаходимо всі повідомлення, які не мають prev_id (початкові)
-        root_messages = [msg for msg in messages_data if not msg.get("prev_id")]
+        root_messages = [msg for msg in messages_data if not msg.get("prev_id") or msg.get("prev_id") == 0]
         
         if not root_messages:
-            # Якщо немає початкових, сортуємо за датою
             sorted_messages = sorted(messages_data, key=lambda x: x.get("created_at", 0))
         else:
-            # Будуємо ланцюжок від початкового повідомлення
             sorted_messages = []
             visited = set()
             
@@ -154,18 +110,14 @@ class XanoClient:
                 msg = messages_dict[msg_id]
                 sorted_messages.append(msg)
                 
-                # Знаходимо наступне повідомлення (де prev_id = поточний id)
                 for other_msg in messages_data:
                     if other_msg.get("prev_id") == msg_id and other_msg["id"] not in visited:
                         build_chain(other_msg["id"])
             
-            # Починаємо з першого root повідомлення
             build_chain(root_messages[0]["id"])
         
-        # Конвертуємо в формат для агента
         conversation_history = []
         for msg in sorted_messages:
-            # Парсимо user content
             user_content_raw = msg.get("user_content", "{}")
             try:
                 if isinstance(user_content_raw, str):
@@ -177,7 +129,6 @@ class XanoClient:
             
             user_text = user_content.get("text", "") if isinstance(user_content, dict) else ""
             
-            # Парсимо AI content
             ai_content_raw = msg.get("ai_content", "[]")
             try:
                 if isinstance(ai_content_raw, str):
@@ -192,7 +143,6 @@ class XanoClient:
                 if isinstance(ai_content[0], dict):
                     ai_text = ai_content[0].get("text", "")
             
-            # Додаємо обидва повідомлення якщо вони є
             if user_text:
                 conversation_history.append({
                     "role": "user",
@@ -217,19 +167,17 @@ class XanoClient:
         run_info: Optional[Dict] = None,
         ai_message_info: Optional[Dict] = None
     ) -> Dict[str, Any]:
-        """Зберігає пару повідомлень (користувач + AI) в один рядок"""
         
         timestamp = int(datetime.now().timestamp() * 1000)
         
         message_record = {
             "ub_id": ub_id,
-            "role": "assistant",  # Основна роль - assistant, бо це фінальна відповідь
+            "role": "assistant",
             "created_at": timestamp,
             "status": "new",
             "block_id": ub_id,
         }
         
-        # User content
         message_record["user_content"] = json.dumps({
             "type": "text",
             "text": user_message,
@@ -241,7 +189,6 @@ class XanoClient:
             "images": None
         })
         
-        # AI content
         message_record["ai_content"] = json.dumps([{
             "text": ai_response,
             "title": "",
@@ -251,8 +198,11 @@ class XanoClient:
             "additional": ""
         }])
         
-        if prev_id:
+        if prev_id and prev_id > 0:
             message_record["prev_id"] = prev_id
+        else:
+            message_record["prev_id"] = 0
+        
         if run_info:
             message_record["run_info"] = json.dumps(run_info) if isinstance(run_info, dict) else run_info
         if ai_message_info:
@@ -262,7 +212,10 @@ class XanoClient:
             response = await self.client.post(f"{self.base_url}/add_air", json=message_record)
             if response.status_code in [200, 201]:
                 result = response.json()
-                print(f"✅ Message pair saved: id={result.get('id')}, user+ai")
+                new_msg_id = result.get('id')
+                
+                print(f"✅ Message pair saved: id={new_msg_id}, user+ai, prev_id={prev_id or 0}")
+                
                 return result
             else:
                 print(f"❌ Failed to save message pair: {response.status_code}")
@@ -285,7 +238,7 @@ class XanoClient:
         last_air_id: Optional[int] = None
     ) -> Dict[str, Any]:
         update_data = {
-            "ub_id": int(ub_id),  # Переконуємось що це int
+            "ub_id": int(ub_id),
             "status": status.value
         }
         if grade:
@@ -316,17 +269,6 @@ class XanoClient:
             import traceback
             traceback.print_exc()
             return {"status": "ok", "message": "Status update failed but continuing"}
-    
-    async def update_block_agent(self, block_id: int, agent_id: str) -> Dict[str, Any]:
-        response = await self.client.patch(
-            f"{self.base_url}/block/{block_id}",
-            json={"assistant_id": agent_id}
-        )
-        response.raise_for_status()
-        return response.json()
-    
-    async def update_session_ids(self, ub_id: int, agent_id: str, session_id: str) -> Dict[str, Any]:
-        return {"status": "ok", "message": "Session IDs saved"}
 
 
 class AgentManager:
@@ -346,14 +288,6 @@ class AgentManager:
             instructions += json.dumps(specs_data, ensure_ascii=False)
         
         return instructions
-    
-    def parse_functions(self, function_list: str) -> List[Dict]:
-        if not function_list:
-            return []
-        try:
-            return json.loads(function_list)
-        except:
-            return []
     
     def parse_tools(self, function_list: List[Dict]) -> List[callable]:
         if not function_list:
@@ -487,74 +421,36 @@ class AgentManager:
         xano: Optional[XanoClient]
     ) -> Dict[str, Any]:
         results = {}
-        tool_calls_map = {}  # Зберігаємо ToolCallItem для пошуку імен
         
-        # Спочатку збираємо всі ToolCallItem
-        for item in items:
-            item_type = type(item).__name__
-            if item_type == "ToolCallItem":
-                # Зберігаємо ім'я функції з ToolCallItem
-                if hasattr(item, 'raw_item'):
-                    raw_item = item.raw_item
-                    if hasattr(raw_item, 'name'):
-                        tool_calls_map[id(item)] = raw_item.name
-                    elif hasattr(raw_item, 'function') and hasattr(raw_item.function, 'name'):
-                        tool_calls_map[id(item)] = raw_item.function.name
-        
-        # Тепер обробляємо всі елементи
         for i, item in enumerate(items):
             item_type = type(item).__name__
             print(f"   📦 Item {i}: {item_type}")
             
-            # Перевіряємо різні типи елементів
             if item_type == "ToolCallOutputItem":
-                # Пробуємо різні способи отримати ім'я функції
                 func_name = None
                 result_value = None
                 
-                # Спосіб 1: через agent атрибут
-                if hasattr(item, 'agent') and hasattr(item.agent, 'name'):
-                    print(f"      Agent name: {item.agent.name}")
-                
-                # Спосіб 2: детально дивимось raw_item
                 if hasattr(item, 'raw_item'):
                     raw_item = item.raw_item
-                    print(f"      raw_item type: {type(raw_item).__name__}")
-                    print(f"      raw_item attributes: {[attr for attr in dir(raw_item) if not attr.startswith('_')]}")
                     
-                    # Пробуємо різні шляхи
                     if hasattr(raw_item, 'name'):
                         func_name = raw_item.name
-                        print(f"      Found name in raw_item.name: {func_name}")
-                    elif hasattr(raw_item, 'function'):
-                        if hasattr(raw_item.function, 'name'):
-                            func_name = raw_item.function.name
-                            print(f"      Found name in raw_item.function.name: {func_name}")
-                    elif hasattr(raw_item, 'tool_call_id'):
-                        print(f"      tool_call_id: {raw_item.tool_call_id}")
+                    elif hasattr(raw_item, 'function') and hasattr(raw_item.function, 'name'):
+                        func_name = raw_item.function.name
                     
-                    # Якщо є output, спробуємо його розпарсити
                     if hasattr(raw_item, 'output'):
                         result_value = raw_item.output
-                        print(f"      raw_item.output: {result_value}")
                 
-                # Спосіб 3: через output
                 if hasattr(item, 'output'):
                     result_value = item.output
-                    print(f"      item.output: {result_value}")
                     
-                    # Іноді в output є вся інформація
                     if isinstance(result_value, dict):
                         if 'status' in result_value and 'grade' in result_value:
                             func_name = 'status_grade'
-                            print(f"      Detected status_grade from output structure")
                         elif 'numbers' in result_value:
                             func_name = 'random_numbers'
-                            print(f"      Detected random_numbers from output structure")
                 
-                # Спосіб 4: пошук в попередніх ToolCallItem
                 if not func_name and i > 0:
-                    # Шукаємо попередній ToolCallItem
                     for j in range(i-1, -1, -1):
                         if type(items[j]).__name__ == "ToolCallItem":
                             prev_item = items[j]
@@ -562,15 +458,11 @@ class AgentManager:
                                 prev_raw = prev_item.raw_item
                                 if hasattr(prev_raw, 'name'):
                                     func_name = prev_raw.name
-                                    print(f"      Found name from previous ToolCallItem: {func_name}")
                                 elif hasattr(prev_raw, 'function') and hasattr(prev_raw.function, 'name'):
                                     func_name = prev_raw.function.name
-                                    print(f"      Found name from previous ToolCallItem function: {func_name}")
                             break
                 
                 if not func_name:
-                    print(f"   ⚠️  Could not extract function name from ToolCallOutputItem")
-                    print(f"   Available attributes: {[attr for attr in dir(item) if not attr.startswith('_')]}")
                     continue
                 
                 print(f"   🎯 Tool called: {func_name}")
@@ -582,7 +474,6 @@ class AgentManager:
                             status = result_value.get("status")
                             grade = result_value.get("grade", "")
                         elif isinstance(result_value, str):
-                            # Якщо результат - рядок, пробуємо розпарсити як JSON
                             try:
                                 parsed = json.loads(result_value)
                                 status = parsed.get("status")
@@ -597,7 +488,6 @@ class AgentManager:
                         print(f"   🎯 Parsed status_grade: status={status}, grade={grade}")
                         
                         if ub_id and xano and status:
-                            # Перевіряємо чи статус валідний для Xano
                             valid_statuses = [s.value for s in ChatStatus]
                             if status not in valid_statuses:
                                 print(f"   ⚠️  Invalid status '{status}' for Xano. Valid: {valid_statuses}")
@@ -616,17 +506,10 @@ class AgentManager:
                         }
                     except Exception as e:
                         print(f"   ❌ Error handling status_grade: {e}")
-                        import traceback
-                        traceback.print_exc()
                         results[func_name] = {"success": False, "error": str(e)}
                 
                 elif func_name == "random_numbers":
-                    try:
-                        print(f"   🎲 Function call: random_numbers -> {result_value}")
-                        results[func_name] = result_value
-                    except Exception as e:
-                        print(f"   ❌ Error handling random_numbers: {e}")
-                        results[func_name] = {"success": False, "error": str(e)}
+                    results[func_name] = result_value
         
         return results if results else None
 
@@ -637,58 +520,82 @@ class EvaluationAgent:
     
     def build_evaluation_prompt(
         self,
-        template_instructions: str,
-        specifications: Dict[str, Any],
+        eval_instructions: str,
+        specifications: Any,
         criteria: List[Dict[str, Any]]
     ) -> str:
-        prompt = template_instructions
+        prompt = eval_instructions
         
         if specifications:
-            prompt += "\n\n# Assignment Specifications:\n"
-            # specifications це список dict з questions та key_concepts
+            prompt += "\n\n# Questions and Key Concepts:\n"
             if isinstance(specifications, list):
                 for i, spec in enumerate(specifications, 1):
-                    prompt += f"\n## Question {i}:\n"
-                    prompt += f"Question: {spec.get('question', '')}\n"
+                    prompt += f"\nQuestion {i}: {spec.get('question', '')}\n"
                     prompt += f"Key Concepts: {spec.get('key_concepts', '')}\n"
             elif isinstance(specifications, dict):
                 for key, value in specifications.items():
-                    prompt += f"\n## {key}:\n{value}\n"
+                    prompt += f"\n{key}: {value}\n"
         
         if criteria:
             prompt += "\n\n# Evaluation Criteria:\n"
             for i, criterion in enumerate(criteria, 1):
-                prompt += f"\n## Criterion {i}:\n"
-                prompt += f"Criterion Name: {criterion.get('criterion_name', f'Criterion {i}')}\n"
-                prompt += f"Max Points: {criterion.get('max_points', 0)}\n"
-                prompt += f"Summary Instructions: {criterion.get('summary_instructions', '')}\n"
-                prompt += f"Grading Instructions: {criterion.get('grading_instructions', '')}\n"
+                crit_name = criterion.get('criterion_name', f'Criterion {i}')
+                max_pts = criterion.get('max_points', 0)
+                summary = criterion.get('summary_instructions', '')
+                grading = criterion.get('grading_instructions', '')
+                
+                prompt += f"\n## Criterion {i}"
+                if crit_name:
+                    prompt += f": {crit_name}"
+                prompt += f"\nMax Points: {max_pts}\n"
+                if summary:
+                    prompt += f"Summary Instructions: {summary}\n"
+                if grading:
+                    prompt += f"Grading Instructions: {grading}\n"
         
         return prompt
     
     async def evaluate_chat(
         self,
         conversation_history: List[Dict[str, str]],
-        template: Dict[str, Any],
-        specifications: Any,  # Може бути list або dict
+        eval_instructions: str,
+        specifications: Any,
         criteria: List[Dict[str, Any]]
     ) -> Dict[str, Any]:
+        
         system_prompt = self.build_evaluation_prompt(
-            template.get("eval_instructions", ""),
+            eval_instructions,
             specifications,
             criteria
         )
         
-        messages = [{"role": "system", "content": system_prompt}] + conversation_history
+        messages = [{"role": "system", "content": system_prompt}]
+        messages.extend(conversation_history)
+        messages.append({
+            "role": "user",
+            "content": "Please evaluate this conversation according to the provided criteria. Provide a detailed assessment with explanation for each criterion and calculate the final grade."
+        })
+        
+        print(f"   📝 Evaluation prompt: {len(system_prompt)} chars")
+        print(f"   💬 Conversation: {len(conversation_history)} messages")
+        print(f"   📊 Criteria: {len(criteria)}")
         
         response = self.client.chat.completions.create(
-            model=template.get("model", Config.DEFAULT_MODEL),
-            messages=messages
+            model=Config.DEFAULT_MODEL,
+            messages=messages,
+            temperature=0.3,
+            max_tokens=2000
         )
         
+        evaluation_text = response.choices[0].message.content
+        
+        print(f"   ✅ Evaluation: {len(evaluation_text)} chars")
+        
         return {
-            "evaluation": response.choices[0].message.content,
-            "timestamp": datetime.now().isoformat()
+            "evaluation": evaluation_text,
+            "timestamp": datetime.now().isoformat(),
+            "conversation_length": len(conversation_history),
+            "criteria_count": len(criteria)
         }
 
 
@@ -748,14 +655,20 @@ async def process_student_message(
         history = await xano.get_conversation_history(message.ub_id, session)
         
         print(f"📖 History loaded: {len(history)} messages")
-        for i, h in enumerate(history[-5:]):  # Показуємо останні 5
+        for i, h in enumerate(history[-5:]):
             print(f"  {i}: role={h.get('role')}, content={h.get('content')[:50]}...")
         
-        # Отримуємо prev_id для ланцюжка
-        messages_data = await xano.get_messages(message.ub_id, limit=1)
-        last_air_id = messages_data[0]["id"] if messages_data else None
+        last_air_id = session.get("last_air_id")
+        if not last_air_id or last_air_id == 0:
+            messages_data = await xano.get_messages(message.ub_id)
+            if messages_data:
+                messages_data.sort(key=lambda x: x.get("created_at", 0))
+                last_air_id = messages_data[-1]["id"]
+            else:
+                last_air_id = 0
         
-        # Відправляємо повідомлення агенту
+        print(f"📍 Using prev_id: {last_air_id}")
+        
         ai_response, run_info, msg_info, function_calls = await agent_manager.send_message(
             agent,
             message.content,
@@ -764,11 +677,10 @@ async def process_student_message(
             xano
         )
         
-        # Зберігаємо пару повідомлень в один рядок
         saved_msg = await xano.save_message_pair(
             message.ub_id, 
-            message.content,  # user message
-            ai_response,      # ai response
+            message.content,
+            ai_response,
             last_air_id,
             run_info,
             msg_info
@@ -778,7 +690,6 @@ async def process_student_message(
             print(f"ERROR: Failed to save message pair properly")
             raise HTTPException(status_code=500, detail="Failed to save message")
         
-        # Оновлюємо статус якщо функція не викликалась
         if not function_calls or "status_grade" not in function_calls:
             await xano.update_chat_status(
                 message.ub_id,
@@ -809,19 +720,14 @@ async def evaluate_chat(ub_id: int):
         session = await xano.get_chat_session(ub_id)
         block = await xano.get_block(session["block_id"])
         
-        eval_template_id = block.get("eval_template_id")
-        if not eval_template_id:
-            raise HTTPException(status_code=400, detail="No evaluation template configured for this block")
-        
-        eval_template_data = await xano.get_template(eval_template_id)
+        eval_instructions = block.get("eval_instructions")
+        if not eval_instructions:
+            raise HTTPException(status_code=400, detail="No evaluation instructions configured for this block")
         
         conversation_history = await xano.get_conversation_history(ub_id, session)
         
         print(f"📊 Starting evaluation for ub_id={ub_id}")
-        print(f"   Block specifications type: {type(block.get('specifications'))}")
-        print(f"   Criteria type: {type(eval_template_data.get('eval_crit_json'))}")
         
-        # Specifications можуть бути списком або dict
         specifications = block.get("specifications", [])
         if isinstance(specifications, str):
             try:
@@ -829,8 +735,7 @@ async def evaluate_chat(ub_id: int):
             except:
                 specifications = []
         
-        # Criteria - це список
-        criteria = eval_template_data.get("eval_crit_json", [])
+        criteria = block.get("eval_crit_json", [])
         if isinstance(criteria, str):
             try:
                 criteria = json.loads(criteria)
@@ -840,7 +745,7 @@ async def evaluate_chat(ub_id: int):
         eval_agent = EvaluationAgent(openai_client)
         evaluation = await eval_agent.evaluate_chat(
             conversation_history=conversation_history,
-            template=eval_template_data,
+            eval_instructions=eval_instructions,
             specifications=specifications,
             criteria=criteria
         )
@@ -860,10 +765,11 @@ async def get_chat_history(ub_id: int):
         session = await xano.get_chat_session(ub_id)
         messages = await xano.get_messages(ub_id)
         
-        # Парсимо повідомлення для зручного відображення
+        print(f"📊 Debug /chat/{ub_id}/history:")
+        print(f"   Raw messages from Xano: {len(messages)}")
+        
         parsed_messages = []
         for msg in messages:
-            # Парсимо user content
             user_content_raw = msg.get("user_content", "{}")
             try:
                 user_content = json.loads(user_content_raw) if isinstance(user_content_raw, str) else user_content_raw
@@ -872,7 +778,6 @@ async def get_chat_history(ub_id: int):
             
             user_text = user_content.get("text", "") if isinstance(user_content, dict) else ""
             
-            # Парсимо AI content
             ai_content_raw = msg.get("ai_content", "[]")
             try:
                 ai_content = json.loads(ai_content_raw) if isinstance(ai_content_raw, str) else ai_content_raw
@@ -884,15 +789,19 @@ async def get_chat_history(ub_id: int):
                 if isinstance(ai_content[0], dict):
                     ai_text = ai_content[0].get("text", "")
             
-            # Створюємо запис для кожної пари
+            print(f"   Message {msg.get('id')}: user={bool(user_text)}, ai={bool(ai_text)}")
+            
             if user_text or ai_text:
                 parsed_messages.append({
                     "id": msg.get("id"),
                     "user_message": user_text,
                     "ai_message": ai_text,
                     "created_at": msg.get("created_at"),
-                    "prev_id": msg.get("prev_id")
+                    "prev_id": msg.get("prev_id"),
+                    "next_id": msg.get("next_id")
                 })
+        
+        print(f"   Parsed messages: {len(parsed_messages)}")
         
         return {
             "messages": parsed_messages,
@@ -919,6 +828,51 @@ async def clear_chat_memory(ub_id: int):
         
         return {"status": "memory cleared"}
         
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/debug/xano-endpoints")
+async def debug_xano_endpoints():
+    return {
+        "message": "Xano uses /add_air for creating records only",
+        "available_endpoints": {
+            "get_list": "GET /air?ub_id={ub_id}",
+            "create": "POST /add_air"
+        },
+        "note": "next_id managed by Xano, prev_id creates the chain"
+    }
+
+
+@app.post("/debug/test-evaluation/{ub_id}")
+async def test_evaluation_prompt(ub_id: int):
+    try:
+        session = await xano.get_chat_session(ub_id)
+        block = await xano.get_block(session["block_id"])
+        
+        eval_instructions = block.get("eval_instructions", "")
+        specifications = block.get("specifications", [])
+        criteria = block.get("eval_crit_json", [])
+        
+        if isinstance(specifications, str):
+            specifications = json.loads(specifications)
+        if isinstance(criteria, str):
+            criteria = json.loads(criteria)
+        
+        eval_agent = EvaluationAgent(openai_client)
+        prompt = eval_agent.build_evaluation_prompt(
+            eval_instructions,
+            specifications,
+            criteria
+        )
+        
+        return {
+            "eval_instructions_length": len(eval_instructions),
+            "specifications": specifications,
+            "criteria": criteria,
+            "full_prompt": prompt,
+            "prompt_length": len(prompt)
+        }
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
