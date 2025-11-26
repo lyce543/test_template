@@ -9,7 +9,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 import httpx
 from openai import OpenAI
-from agents import Agent, Runner, function_tool
+from agents import Agent, Runner, RunConfig, RunContextWrapper, TResponseInputItem, ModelSettings, function_tool, trace
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -20,7 +20,6 @@ class Config:
     XANO_API_KEY = os.getenv("XANO_API_KEY", "")
     OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
     DEFAULT_MODEL = "gpt-4o"
-    MAX_MESSAGES_PER_SESSION = 100
 
 
 class ChatStatus(str, Enum):
@@ -57,14 +56,10 @@ class XanoClient:
         if api_key and api_key != "your_xano_api_key_here":
             headers["Authorization"] = f"Bearer {api_key}"
         
-        self.client = httpx.AsyncClient(
-            headers=headers,
-            timeout=30.0
-        )
+        self.client = httpx.AsyncClient(headers=headers, timeout=30.0)
     
     async def get_block(self, block_id: int) -> Dict[str, Any]:
-        url = f"{self.base_url}/block/{block_id}"
-        response = await self.client.get(url)
+        response = await self.client.get(f"{self.base_url}/block/{block_id}")
         response.raise_for_status()
         return response.json()
     
@@ -74,8 +69,7 @@ class XanoClient:
         return response.json()
     
     async def get_chat_session(self, ub_id: int) -> Dict[str, Any]:
-        url = f"{self.base_url}/ub/{ub_id}"
-        response = await self.client.get(url)
+        response = await self.client.get(f"{self.base_url}/ub/{ub_id}")
         response.raise_for_status()
         return response.json()
     
@@ -87,14 +81,13 @@ class XanoClient:
         response.raise_for_status()
         return response.json()
     
-    async def get_conversation_history(self, ub_id: int, session_data: Dict[str, Any]) -> List[Dict[str, str]]:
+    async def get_conversation_history(self, ub_id: int, session_data: Dict[str, Any]) -> List[TResponseInputItem]:
         messages_data = await self.get_messages(ub_id)
         
         if not messages_data:
             return []
         
         messages_dict = {msg["id"]: msg for msg in messages_data}
-        
         root_messages = [msg for msg in messages_data if not msg.get("prev_id") or msg.get("prev_id") == 0]
         
         if not root_messages:
@@ -116,14 +109,11 @@ class XanoClient:
             
             build_chain(root_messages[0]["id"])
         
-        conversation_history = []
+        conversation_history: List[TResponseInputItem] = []
         for msg in sorted_messages:
             user_content_raw = msg.get("user_content", "{}")
             try:
-                if isinstance(user_content_raw, str):
-                    user_content = json.loads(user_content_raw)
-                else:
-                    user_content = user_content_raw
+                user_content = json.loads(user_content_raw) if isinstance(user_content_raw, str) else user_content_raw
             except:
                 user_content = {}
             
@@ -131,10 +121,7 @@ class XanoClient:
             
             ai_content_raw = msg.get("ai_content", "[]")
             try:
-                if isinstance(ai_content_raw, str):
-                    ai_content = json.loads(ai_content_raw)
-                else:
-                    ai_content = ai_content_raw
+                ai_content = json.loads(ai_content_raw) if isinstance(ai_content_raw, str) else ai_content_raw
             except:
                 ai_content = []
             
@@ -146,16 +133,15 @@ class XanoClient:
             if user_text:
                 conversation_history.append({
                     "role": "user",
-                    "content": user_text
+                    "content": [{"type": "input_text", "text": user_text}]
                 })
             
             if ai_text:
                 conversation_history.append({
                     "role": "assistant",
-                    "content": ai_text
+                    "content": [{"type": "output_text", "text": ai_text}]
                 })
         
-        print(f"📚 Loaded conversation history: {len(conversation_history)} messages")
         return conversation_history
     
     async def save_message_pair(
@@ -167,7 +153,6 @@ class XanoClient:
         run_info: Optional[Dict] = None,
         ai_message_info: Optional[Dict] = None
     ) -> Dict[str, Any]:
-        
         timestamp = int(datetime.now().timestamp() * 1000)
         
         message_record = {
@@ -176,32 +161,26 @@ class XanoClient:
             "created_at": timestamp,
             "status": "new",
             "block_id": ub_id,
+            "user_content": json.dumps({
+                "type": "text",
+                "text": user_message,
+                "file_url": "",
+                "created_at": timestamp,
+                "error_message": "",
+                "error_code": "",
+                "file": None,
+                "images": None
+            }),
+            "ai_content": json.dumps([{
+                "text": ai_response,
+                "title": "",
+                "created_at": timestamp,
+                "type": None,
+                "grade": None,
+                "additional": ""
+            }]),
+            "prev_id": prev_id if prev_id and prev_id > 0 else 0
         }
-        
-        message_record["user_content"] = json.dumps({
-            "type": "text",
-            "text": user_message,
-            "file_url": "",
-            "created_at": timestamp,
-            "error_message": "",
-            "error_code": "",
-            "file": None,
-            "images": None
-        })
-        
-        message_record["ai_content"] = json.dumps([{
-            "text": ai_response,
-            "title": "",
-            "created_at": timestamp,
-            "type": None,
-            "grade": None,
-            "additional": ""
-        }])
-        
-        if prev_id and prev_id > 0:
-            message_record["prev_id"] = prev_id
-        else:
-            message_record["prev_id"] = 0
         
         if run_info:
             message_record["run_info"] = json.dumps(run_info) if isinstance(run_info, dict) else run_info
@@ -211,24 +190,11 @@ class XanoClient:
         try:
             response = await self.client.post(f"{self.base_url}/add_air", json=message_record)
             if response.status_code in [200, 201]:
-                result = response.json()
-                new_msg_id = result.get('id')
-                
-                print(f"✅ Message pair saved: id={new_msg_id}, user+ai, prev_id={prev_id or 0}")
-                
-                return result
-            else:
-                print(f"❌ Failed to save message pair: {response.status_code}")
-                print(f"   Response: {response.text[:200]}")
+                return response.json()
         except Exception as e:
             print(f"❌ Exception saving message pair: {e}")
         
-        return {
-            "id": timestamp,
-            "ub_id": ub_id,
-            "created_at": timestamp,
-            "status": "new"
-        }
+        return {"id": timestamp, "ub_id": ub_id, "created_at": timestamp, "status": "new"}
     
     async def update_chat_status(
         self, 
@@ -237,59 +203,34 @@ class XanoClient:
         grade: Optional[GradeResult] = None,
         last_air_id: Optional[int] = None
     ) -> Dict[str, Any]:
-        update_data = {
-            "ub_id": int(ub_id),
-            "status": status.value
-        }
+        update_data = {"ub_id": int(ub_id), "status": status.value}
         if grade:
             update_data["grade"] = grade.value
         if last_air_id:
             update_data["last_air_id"] = int(last_air_id)
         
-        print(f"   📤 Sending to Xano update_ub: {update_data}")
-        
         try:
-            response = await self.client.post(
-                f"{self.base_url}/update_ub",
-                json=update_data
-            )
-            
-            print(f"   📥 Xano response status: {response.status_code}")
-            
+            response = await self.client.post(f"{self.base_url}/update_ub", json=update_data)
             if response.status_code in [200, 201]:
-                print(f"✅ Chat status updated: {status.value}, grade: {grade.value if grade else 'none'}")
                 return response.json()
-            else:
-                error_text = response.text[:500]
-                print(f"⚠️  Failed to update chat status: {response.status_code}")
-                print(f"   Response: {error_text}")
-                return {"status": "ok", "message": "Status update failed but continuing"}
+            return {"status": "ok", "message": "Status update failed but continuing"}
         except Exception as e:
             print(f"⚠️  Exception updating chat status: {e}")
-            import traceback
-            traceback.print_exc()
             return {"status": "ok", "message": "Status update failed but continuing"}
 
 
-class AgentManager:
-    def __init__(self, openai_client: OpenAI):
-        self.client = openai_client
-        self.agents_cache = {}
+class WorkflowTemplateContext:
+    def __init__(self, template_instructions: str, specifications: str):
+        self.template_instructions = template_instructions
+        self.specifications = specifications
+
+
+class WorkflowManager:
+    def __init__(self, openai_api_key: str):
+        self.openai_api_key = openai_api_key
+        self.workflows_cache = {}
     
-    def build_instructions(self, template_instructions: str, specifications: Any) -> str:
-        instructions = template_instructions
-        
-        if specifications:
-            instructions += "\n\n# Assignment Specifications Structure: \n"
-            instructions += json.dumps(specifications.get("params_structure", []), ensure_ascii=False) if isinstance(specifications, dict) else ""
-            instructions += "\n\n# Specifications: \n"
-            
-            specs_data = specifications.get("specifications", {}) if isinstance(specifications, dict) else {}
-            instructions += json.dumps(specs_data, ensure_ascii=False)
-        
-        return instructions
-    
-    def parse_tools(self, function_list: List[Dict]) -> List[callable]:
+    def create_tools(self, function_list: List[Dict]) -> List[callable]:
         if not function_list:
             return []
         
@@ -299,120 +240,109 @@ class AgentManager:
             if func.get("name") == "status_grade":
                 @function_tool
                 def status_grade(status: str, grade: str = "") -> dict:
-                    """Update the current chat's status and assign a pass/fail grade.
-                    
-                    Args:
-                        status: The current status. Valid values: "idle", "started", "finished", "blocked"
-                        grade: The grade. Valid values: "pass", "fail", or empty string ""
-                    
-                    Returns:
-                        dict: Confirmation with status and grade
-                    """
                     return {"status": status, "grade": grade, "success": True}
-                
                 tools.append(status_grade)
             
             elif func.get("name") == "random_numbers":
                 @function_tool
                 def random_numbers(array_length: int) -> dict:
-                    """Get an array of N random numbers.
-                    
-                    Args:
-                        array_length: Length of the array
-                    """
                     import random
                     numbers = [random.randint(0, 1000000) for _ in range(array_length)]
                     return {"numbers": numbers, "success": True}
-                
                 tools.append(random_numbers)
         
         return tools
     
-    async def get_or_create_agent(
+    def create_workflow_agent(
         self,
-        block: Dict[str, Any],
-        template: Dict[str, Any],
-        xano: XanoClient
+        template_instructions: str,
+        specifications: Any,
+        tools: List[callable],
+        model: str = Config.DEFAULT_MODEL
     ) -> Agent:
-        block_id = block["id"]
         
-        if block_id in self.agents_cache:
-            return self.agents_cache[block_id]
-        
-        instructions = self.build_instructions(
-            template.get("instructions", ""),
-            {
-                "params_structure": template.get("params_structure", []),
-                "specifications": block.get("specifications", {})
-            }
-        )
-        
-        if template.get("int_function_calling"):
-            instructions += "\n\n" + template.get("int_function_calling", "")
-        
-        tools = self.parse_tools(template.get("function_list", []))
-        
-        print(f"🔧 Creating agent with {len(tools)} tools: {[t.__name__ if hasattr(t, '__name__') else 'unknown' for t in tools]}")
+        def agent_instructions(run_context: RunContextWrapper, _agent: Agent):
+            specs_json = json.dumps(specifications, ensure_ascii=False)
+            return f"""{template_instructions}
+
+# Specifications:
+{specs_json}
+"""
         
         agent = Agent(
-            name=f"{template.get('name', 'Assistant')} - Block {block_id}",
-            instructions=instructions,
-            model=template.get("model", Config.DEFAULT_MODEL),
-            tools=tools if tools else []
+            name="Interview Agent",
+            instructions=agent_instructions,
+            model=model,
+            tools=tools,
+            model_settings=ModelSettings(
+                temperature=1,
+                top_p=1,
+                max_tokens=2048,
+                store=True
+            )
         )
-        
-        self.agents_cache[block_id] = agent
         
         return agent
     
-    async def send_message(
+    async def run_workflow(
         self,
-        agent: Agent,
-        message: str,
-        history: Optional[List[Dict[str, str]]] = None,
-        ub_id: Optional[int] = None,
-        xano: Optional[XanoClient] = None
+        block: Dict[str, Any],
+        template: Dict[str, Any],
+        user_message: str,
+        conversation_history: List[TResponseInputItem],
+        ub_id: int,
+        xano: XanoClient
     ) -> tuple[str, Dict, Dict, Optional[Dict]]:
-        try:
-            messages = []
+        
+        with trace(f"Template: {template.get('name', 'Unknown')}"):
+            template_instructions = template.get("instructions", "")
+            specifications = block.get("specifications", {})
+            tools = self.create_tools(template.get("function_list", []))
             
-            if history:
-                messages.extend(history)
+            agent = self.create_workflow_agent(
+                template_instructions,
+                specifications,
+                tools,
+                template.get("model", Config.DEFAULT_MODEL)
+            )
             
-            messages.append({"role": "user", "content": message})
+            input_history = conversation_history + [{
+                "role": "user",
+                "content": [{"type": "input_text", "text": user_message}]
+            }]
             
-            import asyncio
-            loop = asyncio.get_event_loop()
-            result = await loop.run_in_executor(None, lambda: Runner.run_sync(agent, messages))
+            result = await Runner.run(
+                agent,
+                input=input_history,
+                run_config=RunConfig(
+                    trace_metadata={
+                        "__trace_source__": "edtech-platform",
+                        "block_id": block["id"],
+                        "template_id": template["id"],
+                        "ub_id": ub_id
+                    }
+                )
+            )
             
-            full_response = result.final_output if hasattr(result, 'final_output') else str(result)
-            
-            print(f"🤖 Agent response received")
+            ai_response = result.final_output_as(str)
             
             function_calls = None
-            if hasattr(result, 'new_items') and result.new_items:
-                print(f"🔧 Processing {len(result.new_items)} new items")
+            if result.new_items:
                 function_calls = await self.handle_tool_results(result.new_items, ub_id, xano)
             
             run_info = {
-                "agent_name": agent.name,
+                "workflow_name": template.get("name", "Unknown"),
                 "timestamp": datetime.now().isoformat(),
-                "model": agent.model,
+                "model": template.get("model", Config.DEFAULT_MODEL),
                 "function_calls": function_calls
             }
             
             msg_info = {
-                "agent_name": agent.name,
+                "workflow_name": template.get("name", "Unknown"),
                 "role": "assistant"
             }
             
-            return full_response, run_info, msg_info, function_calls
-            
-        except Exception as e:
-            print(f"ERROR in send_message: {type(e).__name__}: {str(e)}")
-            import traceback
-            traceback.print_exc()
-            return f"Error: {str(e)}", {}, {}, None
+            return ai_response, run_info, msg_info, function_calls
     
     async def handle_tool_results(
         self,
@@ -422,51 +352,19 @@ class AgentManager:
     ) -> Dict[str, Any]:
         results = {}
         
-        for i, item in enumerate(items):
-            item_type = type(item).__name__
-            print(f"   📦 Item {i}: {item_type}")
-            
-            if item_type == "ToolCallOutputItem":
+        for item in items:
+            if hasattr(item, 'type') and item.type == "tool_call_output":
                 func_name = None
                 result_value = None
                 
-                if hasattr(item, 'raw_item'):
-                    raw_item = item.raw_item
-                    
-                    if hasattr(raw_item, 'name'):
-                        func_name = raw_item.name
-                    elif hasattr(raw_item, 'function') and hasattr(raw_item.function, 'name'):
-                        func_name = raw_item.function.name
-                    
-                    if hasattr(raw_item, 'output'):
-                        result_value = raw_item.output
+                if hasattr(item, 'name'):
+                    func_name = item.name
                 
                 if hasattr(item, 'output'):
                     result_value = item.output
-                    
-                    if isinstance(result_value, dict):
-                        if 'status' in result_value and 'grade' in result_value:
-                            func_name = 'status_grade'
-                        elif 'numbers' in result_value:
-                            func_name = 'random_numbers'
-                
-                if not func_name and i > 0:
-                    for j in range(i-1, -1, -1):
-                        if type(items[j]).__name__ == "ToolCallItem":
-                            prev_item = items[j]
-                            if hasattr(prev_item, 'raw_item'):
-                                prev_raw = prev_item.raw_item
-                                if hasattr(prev_raw, 'name'):
-                                    func_name = prev_raw.name
-                                elif hasattr(prev_raw, 'function') and hasattr(prev_raw.function, 'name'):
-                                    func_name = prev_raw.function.name
-                            break
                 
                 if not func_name:
                     continue
-                
-                print(f"   🎯 Tool called: {func_name}")
-                print(f"   📤 Output: {result_value}")
                 
                 if func_name == "status_grade":
                     try:
@@ -485,27 +383,17 @@ class AgentManager:
                             status = None
                             grade = ""
                         
-                        print(f"   🎯 Parsed status_grade: status={status}, grade={grade}")
-                        
                         if ub_id and xano and status:
                             valid_statuses = [s.value for s in ChatStatus]
                             if status not in valid_statuses:
-                                print(f"   ⚠️  Invalid status '{status}' for Xano. Valid: {valid_statuses}")
-                                print(f"   Using 'finished' instead")
                                 status = "finished"
                             
                             chat_status = ChatStatus(status)
                             grade_result = GradeResult(grade) if grade and grade in [g.value for g in GradeResult] else None
-                            
                             await xano.update_chat_status(ub_id, chat_status, grade_result)
                         
-                        results[func_name] = {
-                            "status": status,
-                            "grade": grade,
-                            "success": True
-                        }
+                        results[func_name] = {"status": status, "grade": grade, "success": True}
                     except Exception as e:
-                        print(f"   ❌ Error handling status_grade: {e}")
                         results[func_name] = {"success": False, "error": str(e)}
                 
                 elif func_name == "random_numbers":
@@ -557,28 +445,31 @@ class EvaluationAgent:
     
     async def evaluate_chat(
         self,
-        conversation_history: List[Dict[str, str]],
+        conversation_history: List[TResponseInputItem],
         eval_instructions: str,
         specifications: Any,
         criteria: List[Dict[str, Any]]
     ) -> Dict[str, Any]:
-        
-        system_prompt = self.build_evaluation_prompt(
-            eval_instructions,
-            specifications,
-            criteria
-        )
+        system_prompt = self.build_evaluation_prompt(eval_instructions, specifications, criteria)
         
         messages = [{"role": "system", "content": system_prompt}]
-        messages.extend(conversation_history)
+        
+        for msg in conversation_history:
+            role = msg.get("role", "user")
+            content_list = msg.get("content", [])
+            
+            text_content = ""
+            for content_item in content_list:
+                if isinstance(content_item, dict):
+                    text_content += content_item.get("text", "")
+            
+            if text_content:
+                messages.append({"role": role, "content": text_content})
+        
         messages.append({
             "role": "user",
             "content": "Please evaluate this conversation according to the provided criteria. Provide a detailed assessment with explanation for each criterion and calculate the final grade."
         })
-        
-        print(f"   📝 Evaluation prompt: {len(system_prompt)} chars")
-        print(f"   💬 Conversation: {len(conversation_history)} messages")
-        print(f"   📊 Criteria: {len(criteria)}")
         
         response = self.client.chat.completions.create(
             model=Config.DEFAULT_MODEL,
@@ -589,8 +480,6 @@ class EvaluationAgent:
         
         evaluation_text = response.choices[0].message.content
         
-        print(f"   ✅ Evaluation: {len(evaluation_text)} chars")
-        
         return {
             "evaluation": evaluation_text,
             "timestamp": datetime.now().isoformat(),
@@ -599,11 +488,7 @@ class EvaluationAgent:
         }
 
 
-app = FastAPI(
-    title="EdTech AI Platform",
-    description="AI-powered educational assistant platform",
-    version="2.0.0"
-)
+app = FastAPI(title="EdTech AI Platform", description="AI-powered educational assistant platform", version="2.0.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -615,16 +500,12 @@ app.add_middleware(
 
 xano = XanoClient(Config.XANO_BASE_URL, Config.XANO_API_KEY)
 openai_client = OpenAI(api_key=Config.OPENAI_API_KEY)
-agent_manager = AgentManager(openai_client)
+workflow_manager = WorkflowManager(Config.OPENAI_API_KEY)
 
 
 @app.get("/")
 async def root():
-    return {
-        "status": "operational",
-        "version": "2.0.0",
-        "message": "EdTech AI Platform - Python Backend with OpenAI Agents"
-    }
+    return {"status": "operational", "version": "2.0.0", "message": "EdTech AI Platform - Workflows with OpenAI Agent SDK"}
 
 
 @app.get("/health")
@@ -641,22 +522,13 @@ async def health():
 
 
 @app.post("/chat/message", response_model=AssistantResponse)
-async def process_student_message(
-    message: StudentMessage,
-    background_tasks: BackgroundTasks
-):
+async def process_student_message(message: StudentMessage, background_tasks: BackgroundTasks):
     try:
         session = await xano.get_chat_session(message.ub_id)
         block = await xano.get_block(session["block_id"])
         template_data = await xano.get_template(block["int_template_id"])
         
-        agent = await agent_manager.get_or_create_agent(block, template_data, xano)
-        
-        history = await xano.get_conversation_history(message.ub_id, session)
-        
-        print(f"📖 History loaded: {len(history)} messages")
-        for i, h in enumerate(history[-5:]):
-            print(f"  {i}: role={h.get('role')}, content={h.get('content')[:50]}...")
+        conversation_history = await xano.get_conversation_history(message.ub_id, session)
         
         last_air_id = session.get("last_air_id")
         if not last_air_id or last_air_id == 0:
@@ -667,45 +539,25 @@ async def process_student_message(
             else:
                 last_air_id = 0
         
-        print(f"📍 Using prev_id: {last_air_id}")
-        
-        ai_response, run_info, msg_info, function_calls = await agent_manager.send_message(
-            agent,
-            message.content,
-            history,
-            message.ub_id,
-            xano
+        ai_response, run_info, msg_info, function_calls = await workflow_manager.run_workflow(
+            block, template_data, message.content, conversation_history, message.ub_id, xano
         )
         
         saved_msg = await xano.save_message_pair(
-            message.ub_id, 
-            message.content,
-            ai_response,
-            last_air_id,
-            run_info,
-            msg_info
+            message.ub_id, message.content, ai_response, last_air_id, run_info, msg_info
         )
         
         if not saved_msg or "id" not in saved_msg:
-            print(f"ERROR: Failed to save message pair properly")
             raise HTTPException(status_code=500, detail="Failed to save message")
         
         if not function_calls or "status_grade" not in function_calls:
-            await xano.update_chat_status(
-                message.ub_id,
-                ChatStatus.STARTED,
-                last_air_id=saved_msg["id"]
-            )
+            await xano.update_chat_status(message.ub_id, ChatStatus.STARTED, last_air_id=saved_msg["id"])
         
         try:
             response_json = json.loads(ai_response)
             return AssistantResponse(**response_json)
         except:
-            return AssistantResponse(
-                title="-",
-                text=ai_response,
-                type="interview"
-            )
+            return AssistantResponse(title="-", text=ai_response, type="interview")
         
     except Exception as e:
         print(f"ERROR: {type(e).__name__}: {str(e)}")
@@ -725,8 +577,6 @@ async def evaluate_chat(ub_id: int):
             raise HTTPException(status_code=400, detail="No evaluation instructions configured for this block")
         
         conversation_history = await xano.get_conversation_history(ub_id, session)
-        
-        print(f"📊 Starting evaluation for ub_id={ub_id}")
         
         specifications = block.get("specifications", [])
         if isinstance(specifications, str):
@@ -765,9 +615,6 @@ async def get_chat_history(ub_id: int):
         session = await xano.get_chat_session(ub_id)
         messages = await xano.get_messages(ub_id)
         
-        print(f"📊 Debug /chat/{ub_id}/history:")
-        print(f"   Raw messages from Xano: {len(messages)}")
-        
         parsed_messages = []
         for msg in messages:
             user_content_raw = msg.get("user_content", "{}")
@@ -789,8 +636,6 @@ async def get_chat_history(ub_id: int):
                 if isinstance(ai_content[0], dict):
                     ai_text = ai_content[0].get("text", "")
             
-            print(f"   Message {msg.get('id')}: user={bool(user_text)}, ai={bool(ai_text)}")
-            
             if user_text or ai_text:
                 parsed_messages.append({
                     "id": msg.get("id"),
@@ -800,8 +645,6 @@ async def get_chat_history(ub_id: int):
                     "prev_id": msg.get("prev_id"),
                     "next_id": msg.get("next_id")
                 })
-        
-        print(f"   Parsed messages: {len(parsed_messages)}")
         
         return {
             "messages": parsed_messages,
@@ -823,56 +666,11 @@ async def clear_chat_memory(ub_id: int):
         session = await xano.get_chat_session(ub_id)
         block_id = session.get("block_id")
         
-        if block_id and block_id in agent_manager.agents_cache:
-            del agent_manager.agents_cache[block_id]
+        if block_id and block_id in workflow_manager.workflows_cache:
+            del workflow_manager.workflows_cache[block_id]
         
         return {"status": "memory cleared"}
         
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
-
-
-@app.get("/debug/xano-endpoints")
-async def debug_xano_endpoints():
-    return {
-        "message": "Xano uses /add_air for creating records only",
-        "available_endpoints": {
-            "get_list": "GET /air?ub_id={ub_id}",
-            "create": "POST /add_air"
-        },
-        "note": "next_id managed by Xano, prev_id creates the chain"
-    }
-
-
-@app.post("/debug/test-evaluation/{ub_id}")
-async def test_evaluation_prompt(ub_id: int):
-    try:
-        session = await xano.get_chat_session(ub_id)
-        block = await xano.get_block(session["block_id"])
-        
-        eval_instructions = block.get("eval_instructions", "")
-        specifications = block.get("specifications", [])
-        criteria = block.get("eval_crit_json", [])
-        
-        if isinstance(specifications, str):
-            specifications = json.loads(specifications)
-        if isinstance(criteria, str):
-            criteria = json.loads(criteria)
-        
-        eval_agent = EvaluationAgent(openai_client)
-        prompt = eval_agent.build_evaluation_prompt(
-            eval_instructions,
-            specifications,
-            criteria
-        )
-        
-        return {
-            "eval_instructions_length": len(eval_instructions),
-            "specifications": specifications,
-            "criteria": criteria,
-            "full_prompt": prompt,
-            "prompt_length": len(prompt)
-        }
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
