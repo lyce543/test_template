@@ -3,13 +3,14 @@ from typing import Optional, Dict, Any, List
 from datetime import datetime
 from enum import Enum
 import json
+from pathlib import Path
 
 from fastapi import FastAPI, HTTPException, BackgroundTasks
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 import httpx
 from openai import OpenAI
-from agents import Agent, Runner, RunConfig, RunContextWrapper, TResponseInputItem, ModelSettings, function_tool, trace
+from agents import Agent, Runner, RunConfig, RunContextWrapper, TResponseInputItem, ModelSettings, function_tool, trace, SQLiteSession
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -20,6 +21,7 @@ class Config:
     XANO_API_KEY = os.getenv("XANO_API_KEY", "")
     OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
     DEFAULT_MODEL = "gpt-4o"
+    SESSIONS_DIR = "sessions"
 
 
 class ChatStatus(str, Enum):
@@ -45,6 +47,14 @@ class AssistantResponse(BaseModel):
     text: str
     type: str = "interview"
     additional: Optional[Dict[str, Any]] = None
+
+
+class WorkflowState(BaseModel):
+    questions: List[Dict[str, str]] = []
+    current_question_index: int = 0
+    answers: List[Dict[str, Any]] = []
+    status: str = "active"
+    ub_id: Optional[int] = None
 
 
 class XanoClient:
@@ -219,16 +229,33 @@ class XanoClient:
             return {"status": "ok", "message": "Status update failed but continuing"}
 
 
-class WorkflowTemplateContext:
-    def __init__(self, template_instructions: str, specifications: str):
+class WorkflowContext:
+    def __init__(
+        self,
+        state: WorkflowState,
+        template_instructions: str,
+        specifications: Any,
+        ub_id: int,
+        xano: XanoClient
+    ):
+        self.state = state
         self.template_instructions = template_instructions
         self.specifications = specifications
+        self.ub_id = ub_id
+        self.xano = xano
 
 
-class WorkflowManager:
+class ExaminationWorkflow:
     def __init__(self, openai_api_key: str):
         self.openai_api_key = openai_api_key
-        self.workflows_cache = {}
+        self.sessions: Dict[int, SQLiteSession] = {}
+        Path(Config.SESSIONS_DIR).mkdir(parents=True, exist_ok=True)
+    
+    def get_session(self, ub_id: int) -> SQLiteSession:
+        if ub_id not in self.sessions:
+            session_path = Path(Config.SESSIONS_DIR) / f"ub_{ub_id}.db"
+            self.sessions[ub_id] = SQLiteSession(f"ub_{ub_id}", str(session_path))
+        return self.sessions[ub_id]
     
     def create_tools(self, function_list: List[Dict]) -> List[callable]:
         if not function_list:
@@ -253,23 +280,35 @@ class WorkflowManager:
         
         return tools
     
-    def create_workflow_agent(
+    def create_interview_agent(
         self,
-        template_instructions: str,
-        specifications: Any,
+        context: WorkflowContext,
         tools: List[callable],
         model: str = Config.DEFAULT_MODEL
-    ) -> Agent:
+    ) -> Agent[WorkflowContext]:
         
-        def agent_instructions(run_context: RunContextWrapper, _agent: Agent):
-            specs_json = json.dumps(specifications, ensure_ascii=False)
-            return f"""{template_instructions}
+        def agent_instructions(run_context: RunContextWrapper[WorkflowContext], _agent: Agent):
+            ctx = run_context.context
+            specs_json = json.dumps(ctx.specifications, ensure_ascii=False)
+            
+            state_info = f"""
+Current workflow state:
+- Question {ctx.state.current_question_index + 1} of {len(ctx.state.questions)}
+- Status: {ctx.state.status}
+"""
+            
+            return f"""{ctx.template_instructions}
+
+# Assignment Specifications Structure:
+{specs_json}
 
 # Specifications:
 {specs_json}
+
+{state_info}
 """
         
-        agent = Agent(
+        agent = Agent[WorkflowContext](
             name="Interview Agent",
             instructions=agent_instructions,
             model=model,
@@ -284,39 +323,91 @@ class WorkflowManager:
         
         return agent
     
+    def create_evaluator_agent(
+        self,
+        context: WorkflowContext,
+        model: str = Config.DEFAULT_MODEL
+    ) -> Agent[WorkflowContext]:
+        
+        def agent_instructions(run_context: RunContextWrapper[WorkflowContext], _agent: Agent):
+            ctx = run_context.context
+            current_q = ctx.state.questions[ctx.state.current_question_index] if ctx.state.current_question_index < len(ctx.state.questions) else {}
+            
+            return f"""You are an evaluator for an examination system.
+
+Current question: {current_q.get('question', '')}
+Expected key concepts: {current_q.get('key_concepts', '')}
+
+Evaluate the student's answer and determine:
+1. Is it correct? (yes/no/partial)
+2. Should we ask a follow-up question? (yes/no)
+3. Should we move to next question? (yes/no)
+
+Return your evaluation as JSON.
+"""
+        
+        agent = Agent[WorkflowContext](
+            name="Evaluator Agent",
+            instructions=agent_instructions,
+            model=model,
+            model_settings=ModelSettings(
+                temperature=0.3,
+                top_p=1,
+                max_tokens=1024,
+                store=True
+            )
+        )
+        
+        return agent
+    
     async def run_workflow(
         self,
         block: Dict[str, Any],
         template: Dict[str, Any],
         user_message: str,
-        conversation_history: List[TResponseInputItem],
         ub_id: int,
         xano: XanoClient
     ) -> tuple[str, Dict, Dict, Optional[Dict]]:
         
-        with trace(f"Template: {template.get('name', 'Unknown')}"):
+        with trace(f"ExaminationWorkflow-{ub_id}"):
             template_instructions = template.get("instructions", "")
             specifications = block.get("specifications", {})
-            tools = self.create_tools(template.get("function_list", []))
+            if isinstance(specifications, str):
+                try:
+                    specifications = json.loads(specifications)
+                except:
+                    specifications = []
             
-            agent = self.create_workflow_agent(
-                template_instructions,
-                specifications,
-                tools,
-                template.get("model", Config.DEFAULT_MODEL)
+            state = WorkflowState(
+                questions=specifications if isinstance(specifications, list) else [],
+                current_question_index=0,
+                answers=[],
+                status="active",
+                ub_id=ub_id
             )
             
-            input_history = conversation_history + [{
-                "role": "user",
-                "content": [{"type": "input_text", "text": user_message}]
-            }]
+            context = WorkflowContext(
+                state=state,
+                template_instructions=template_instructions,
+                specifications=specifications,
+                ub_id=ub_id,
+                xano=xano
+            )
+            
+            tools = self.create_tools(template.get("function_list", []))
+            interview_agent = self.create_interview_agent(context, tools, template.get("model", Config.DEFAULT_MODEL))
+            
+            session = self.get_session(ub_id)
             
             result = await Runner.run(
-                agent,
-                input=input_history,
+                interview_agent,
+                user_message,
+                session=session,
+                context=context,
                 run_config=RunConfig(
                     trace_metadata={
                         "__trace_source__": "edtech-platform",
+                        "workflow_type": "examination",
                         "block_id": block["id"],
                         "template_id": template["id"],
                         "ub_id": ub_id
@@ -331,15 +422,19 @@ class WorkflowManager:
                 function_calls = await self.handle_tool_results(result.new_items, ub_id, xano)
             
             run_info = {
+                "workflow_type": "examination",
                 "workflow_name": template.get("name", "Unknown"),
                 "timestamp": datetime.now().isoformat(),
                 "model": template.get("model", Config.DEFAULT_MODEL),
+                "question_index": state.current_question_index,
+                "total_questions": len(state.questions),
                 "function_calls": function_calls
             }
             
             msg_info = {
                 "workflow_name": template.get("name", "Unknown"),
-                "role": "assistant"
+                "role": "assistant",
+                "workflow_state": state.model_dump()
             }
             
             return ai_response, run_info, msg_info, function_calls
@@ -445,11 +540,15 @@ class EvaluationAgent:
     
     async def evaluate_chat(
         self,
-        conversation_history: List[TResponseInputItem],
+        ub_id: int,
+        xano: XanoClient,
         eval_instructions: str,
         specifications: Any,
         criteria: List[Dict[str, Any]]
     ) -> Dict[str, Any]:
+        session_data = await xano.get_chat_session(ub_id)
+        conversation_history = await xano.get_conversation_history(ub_id, session_data)
+        
         system_prompt = self.build_evaluation_prompt(eval_instructions, specifications, criteria)
         
         messages = [{"role": "system", "content": system_prompt}]
@@ -500,7 +599,12 @@ app.add_middleware(
 
 xano = XanoClient(Config.XANO_BASE_URL, Config.XANO_API_KEY)
 openai_client = OpenAI(api_key=Config.OPENAI_API_KEY)
-workflow_manager = WorkflowManager(Config.OPENAI_API_KEY)
+workflow = ExaminationWorkflow(Config.OPENAI_API_KEY)
+
+
+@app.on_event("startup")
+async def startup_event():
+    Path(Config.SESSIONS_DIR).mkdir(parents=True, exist_ok=True)
 
 
 @app.get("/")
@@ -528,8 +632,6 @@ async def process_student_message(message: StudentMessage, background_tasks: Bac
         block = await xano.get_block(session["block_id"])
         template_data = await xano.get_template(block["int_template_id"])
         
-        conversation_history = await xano.get_conversation_history(message.ub_id, session)
-        
         last_air_id = session.get("last_air_id")
         if not last_air_id or last_air_id == 0:
             messages_data = await xano.get_messages(message.ub_id)
@@ -539,8 +641,8 @@ async def process_student_message(message: StudentMessage, background_tasks: Bac
             else:
                 last_air_id = 0
         
-        ai_response, run_info, msg_info, function_calls = await workflow_manager.run_workflow(
-            block, template_data, message.content, conversation_history, message.ub_id, xano
+        ai_response, run_info, msg_info, function_calls = await workflow.run_workflow(
+            block, template_data, message.content, message.ub_id, xano
         )
         
         saved_msg = await xano.save_message_pair(
@@ -576,8 +678,6 @@ async def evaluate_chat(ub_id: int):
         if not eval_instructions:
             raise HTTPException(status_code=400, detail="No evaluation instructions configured for this block")
         
-        conversation_history = await xano.get_conversation_history(ub_id, session)
-        
         specifications = block.get("specifications", [])
         if isinstance(specifications, str):
             try:
@@ -594,7 +694,8 @@ async def evaluate_chat(ub_id: int):
         
         eval_agent = EvaluationAgent(openai_client)
         evaluation = await eval_agent.evaluate_chat(
-            conversation_history=conversation_history,
+            ub_id=ub_id,
+            xano=xano,
             eval_instructions=eval_instructions,
             specifications=specifications,
             criteria=criteria
@@ -663,11 +764,12 @@ async def get_chat_history(ub_id: int):
 @app.post("/chat/{ub_id}/clear-memory")
 async def clear_chat_memory(ub_id: int):
     try:
-        session = await xano.get_chat_session(ub_id)
-        block_id = session.get("block_id")
+        if ub_id in workflow.sessions:
+            del workflow.sessions[ub_id]
         
-        if block_id and block_id in workflow_manager.workflows_cache:
-            del workflow_manager.workflows_cache[block_id]
+        session_path = Path(Config.SESSIONS_DIR) / f"ub_{ub_id}.db"
+        if session_path.exists():
+            session_path.unlink()
         
         return {"status": "memory cleared"}
         
@@ -677,4 +779,5 @@ async def clear_chat_memory(ub_id: int):
 
 if __name__ == "__main__":
     import uvicorn
+    Path(Config.SESSIONS_DIR).mkdir(parents=True, exist_ok=True)
     uvicorn.run(app, host="0.0.0.0", port=8000)
