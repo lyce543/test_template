@@ -73,15 +73,19 @@ class XanoClient:
         response.raise_for_status()
         return response.json()
     
-    async def get_workflow_state(self, ub_id: int, block_id: int) -> Optional[WorkflowState]:
-        response = await self.client.get(f"{self.base_url}/workflow_state", params={"ub_id": ub_id, "block_id": block_id})
-        if response.status_code == 200:
-            data = response.json()
-            if data:
-                state_data = data[0] if isinstance(data, list) else data
-                state_data['questions'] = json.loads(state_data['questions']) if isinstance(state_data['questions'], str) else state_data['questions']
-                state_data['answers'] = json.loads(state_data['answers']) if isinstance(state_data['answers'], str) else state_data['answers']
-                return WorkflowState(**state_data)
+    async def get_workflow_state(self, ub_id: int) -> Optional[WorkflowState]:
+        try:
+            response = await self.client.get(f"{self.base_url}/workflow_state/{ub_id}")
+            if response.status_code == 200:
+                data = response.json()
+                if data:
+                    state_data = data if isinstance(data, dict) else (data[0] if isinstance(data, list) and data else None)
+                    if state_data:
+                        state_data['questions'] = json.loads(state_data['questions']) if isinstance(state_data.get('questions'), str) else state_data.get('questions', [])
+                        state_data['answers'] = json.loads(state_data['answers']) if isinstance(state_data.get('answers'), str) else state_data.get('answers', [])
+                        return WorkflowState(**state_data)
+        except Exception as e:
+            print(f"Error loading workflow state: {e}")
         return None
     
     async def save_workflow_state(self, state: WorkflowState):
@@ -89,14 +93,14 @@ class XanoClient:
             "ub_id": state.ub_id,
             "block_id": state.block_id,
             "current_question_index": state.current_question_index,
-            "questions": json.dumps(state.questions),
-            "answers": json.dumps(state.answers),
+            "questions": json.dumps(state.questions, ensure_ascii=False),
+            "answers": json.dumps(state.answers, ensure_ascii=False),
             "follow_up_count": state.follow_up_count,
             "max_follow_ups": state.max_follow_ups,
             "status": state.status
         }
-        response = await self.client.post(f"{self.base_url}/workflow_state", json=data)
-        return response.json()
+        response = await self.client.post(f"{self.base_url}/save_workflow_state", json=data)
+        return response.json() if response.status_code in [200, 201] else None
     
     async def get_messages(self, ub_id: int) -> List[Dict[str, Any]]:
         response = await self.client.get(f"{self.base_url}/air", params={"ub_id": ub_id})
@@ -204,7 +208,7 @@ Return JSON:
             if isinstance(specifications, str):
                 specifications = json.loads(specifications)
             
-            state = await xano.get_workflow_state(ub_id, block["id"])
+            state = await xano.get_workflow_state(ub_id)
             
             if not state:
                 state = WorkflowState(
@@ -353,6 +357,21 @@ async def process_student_message(message: StudentMessage):
         print(f"ERROR: {type(e).__name__}: {str(e)}")
         import traceback
         traceback.print_exc()
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/chat/{ub_id}/state")
+async def get_workflow_state(ub_id: int):
+    try:
+        state = await xano.get_workflow_state(ub_id)
+        if state:
+            return state.model_dump()
+        else:
+            raise HTTPException(status_code=404, detail="Workflow state not found")
+    except HTTPException:
+        raise
+    except Exception as e:
+        print(f"ERROR: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
 
