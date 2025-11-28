@@ -21,31 +21,44 @@ def test_evaluation(ub_id: int):
     
     print("✅ Сервер запущений\n")
     
-    print("📚 Завантаження історії чату...")
+    print("📚 Завантаження workflow state...")
     try:
-        history_response = requests.get(f"{BASE_URL}/chat/{ub_id}/history")
-        if history_response.status_code == 200:
-            history_data = history_response.json()
-            message_count = history_data.get('count', 0)
-            messages = history_data.get('messages', [])
+        state_response = requests.get(f"{BASE_URL}/chat/{ub_id}/state")
+        if state_response.status_code == 200:
+            state_data = state_response.json()
+            answers_count = len(state_data.get('answers', []))
+            questions_count = len(state_data.get('questions', []))
+            status = state_data.get('status', 'unknown')
             
-            print(f"   Знайдено повідомлень: {message_count}")
+            print(f"   ✅ Стан знайдено")
+            print(f"   📊 Статус: {status}")
+            print(f"   💬 Питань: {questions_count}")
+            print(f"   ✍️  Відповідей: {answers_count}")
             
-            if message_count == 0:
-                print("\n⚠️  Історія порожня. Спочатку відправте кілька повідомлень.")
-                print(f"   Використайте: python test_agents.py {ub_id} 'ваше повідомлення'")
+            if answers_count == 0:
+                print("\n⚠️  Немає відповідей для оцінювання.")
+                print(f"   Спочатку відправте повідомлення:")
+                print(f"   python test_agents.py {ub_id} 'ваша відповідь'")
                 return False
             
-            print("\n📝 Останні повідомлення:")
-            for msg in messages[-3:]:
-                user_msg = msg.get('user_message', '')
-                ai_msg = msg.get('ai_message', '')
-                if user_msg:
-                    print(f"   👤 Student: {user_msg[:80]}...")
-                if ai_msg:
-                    print(f"   🤖 AI: {ai_msg[:80]}...")
+            print("\n📝 Останні відповіді:")
+            for i, ans in enumerate(state_data.get('answers', [])[-3:], 1):
+                answer_text = ans.get('answer', 'немає відповіді')
+                evaluation = ans.get('evaluation', {})
+                complete = evaluation.get('complete', False)
+                
+                print(f"\n  {i}. Відповідь: {answer_text[:80]}...")
+                print(f"     Повна: {complete}")
+                if not complete and evaluation.get('missing_concepts'):
+                    print(f"     Не вистачає: {evaluation.get('missing_concepts')}")
+        
+        elif state_response.status_code == 404:
+            print("❌ Workflow state не знайдено.")
+            print(f"   Спочатку почніть чат:")
+            print(f"   python test_agents.py {ub_id} 'привіт'")
+            return False
         else:
-            print(f"❌ Помилка завантаження історії: {history_response.status_code}")
+            print(f"❌ Помилка завантаження state: {state_response.status_code}")
             return False
     except Exception as e:
         print(f"❌ Помилка: {e}")
@@ -83,7 +96,7 @@ def test_evaluation(ub_id: int):
             criteria_count = data.get('criteria_count', 0)
             
             print(f"🕐 Час: {timestamp}")
-            print(f"💬 Повідомлень в розмові: {conversation_length}")
+            print(f"💬 Відповідей проаналізовано: {conversation_length}")
             print(f"📊 Критеріїв оцінювання: {criteria_count}\n")
             print("📋 Оцінка:\n")
             print(evaluation_text)
@@ -95,6 +108,13 @@ def test_evaluation(ub_id: int):
             error_data = response.json()
             print(f"⚠️  {error_data.get('detail', 'Невідома помилка')}")
             print("\n💡 Можливо, для цього блоку не налаштований evaluation.")
+            return False
+        
+        elif response.status_code == 404:
+            error_data = response.json()
+            print(f"⚠️  {error_data.get('detail', 'Невідома помилка')}")
+            print(f"\n💡 Спочатку відправте відповіді:")
+            print(f"   python test_agents.py {ub_id} 'ваша відповідь'")
             return False
             
         else:
@@ -119,6 +139,10 @@ def main():
         print("❌ Використання: python test_evaluation.py <UB_ID>")
         print("\nПриклад:")
         print("  python test_evaluation.py 12610")
+        print("\nПослідовність тестування:")
+        print("  1. python test_agents.py 12610 'Ембединг'")
+        print("  2. python test_agents.py 12610 'Позиційне кодування'")
+        print("  3. python test_evaluation.py 12610")
         sys.exit(1)
     
     try:

@@ -133,6 +133,18 @@ class WorkflowContext:
         self.state = state
 
 
+class EvaluationContext:
+    def __init__(
+        self,
+        workflow_state: WorkflowState,
+        eval_instructions: str,
+        criteria: List[Dict[str, Any]]
+    ):
+        self.workflow_state = workflow_state
+        self.eval_instructions = eval_instructions
+        self.criteria = criteria
+
+
 class ExaminationWorkflow:
     def __init__(self, openai_api_key: str):
         self.openai_api_key = openai_api_key
@@ -140,6 +152,10 @@ class ExaminationWorkflow:
     def create_interviewer_agent(self, context: WorkflowContext, model: str) -> Agent[WorkflowContext]:
         def agent_instructions(run_context: RunContextWrapper[WorkflowContext], _agent: Agent):
             ctx = run_context.context
+            
+            if ctx.state.current_question_index >= len(ctx.state.questions):
+                return "The exam is complete. Thank the student."
+            
             current_q = ctx.state.questions[ctx.state.current_question_index]
             
             return f"""You are an examiner conducting an oral exam.
@@ -219,6 +235,15 @@ Return JSON:
                     status="active"
                 )
                 await xano.save_workflow_state(state)
+            
+            if state.status == "finished":
+                return "Іспит вже завершено."
+            
+            if state.current_question_index >= len(state.questions):
+                state.status = "finished"
+                await xano.save_workflow_state(state)
+                await xano.update_chat_status(ub_id, ChatStatus.FINISHED)
+                return "Вітаю! Ви відповіли на всі питання. Іспит завершено."
             
             context = WorkflowContext(state=state)
             
@@ -306,6 +331,89 @@ Return JSON:
                     return result.final_output_as(str)
 
 
+class EvaluationWorkflow:
+    def __init__(self, openai_api_key: str):
+        self.openai_api_key = openai_api_key
+    
+    def create_evaluation_agent(self, context: EvaluationContext, model: str) -> Agent[EvaluationContext]:
+        def agent_instructions(run_context: RunContextWrapper[EvaluationContext], _agent: Agent):
+            ctx = run_context.context
+            
+            criteria_text = "\n\n".join([
+                f"## Criterion {i+1}: {crit.get('criterion_name', f'Criterion {i+1}')}\n"
+                f"Max Points: {crit.get('max_points', 0)}\n"
+                f"Summary: {crit.get('summary_instructions', '')}\n"
+                f"Grading: {crit.get('grading_instructions', '')}"
+                for i, crit in enumerate(ctx.criteria)
+            ])
+            
+            questions_text = "\n".join([
+                f"Question {i+1}: {q.get('question', '')}\n"
+                f"Key concepts: {q.get('key_concepts', '')}"
+                for i, q in enumerate(ctx.workflow_state.questions)
+            ])
+            
+            answers_text = "\n".join([
+                f"Answer {i+1}: {ans.get('answer', '')}\n"
+                f"Evaluation: {ans.get('evaluation', {})}"
+                for i, ans in enumerate(ctx.workflow_state.answers)
+            ])
+            
+            return f"""{ctx.eval_instructions}
+
+# Questions and Key Concepts:
+{questions_text}
+
+# Student Answers:
+{answers_text}
+
+# Evaluation Criteria:
+{criteria_text}
+
+Evaluate the student's performance according to the criteria. Provide detailed assessment for each criterion and calculate the final grade.
+
+Format your response as:
+# Evaluation
+
+## Criterion 1
+[Assessment]
+Grade: X/Y
+Comment: [Explanation]
+
+## Criterion 2
+...
+
+# Final Grade: X/Y
+[Overall assessment]"""
+        
+        return Agent[EvaluationContext](
+            name="EvaluationAgent",
+            instructions=agent_instructions,
+            model=model,
+            model_settings=ModelSettings(temperature=0.3, max_tokens=2048)
+        )
+    
+    async def run_evaluation(
+        self,
+        ub_id: int,
+        workflow_state: WorkflowState,
+        eval_instructions: str,
+        criteria: List[Dict[str, Any]],
+        model: str = Config.DEFAULT_MODEL
+    ) -> str:
+        with trace(f"Evaluation-{ub_id}"):
+            context = EvaluationContext(
+                workflow_state=workflow_state,
+                eval_instructions=eval_instructions,
+                criteria=criteria
+            )
+            
+            agent = self.create_evaluation_agent(context, model)
+            result = await Runner.run(agent, "", context=context)
+            
+            return result.final_output_as(str)
+
+
 app = FastAPI(title="EdTech AI Platform", version="2.0.0")
 
 app.add_middleware(
@@ -318,6 +426,7 @@ app.add_middleware(
 
 xano = XanoClient(Config.XANO_BASE_URL, Config.XANO_API_KEY)
 workflow = ExaminationWorkflow(Config.OPENAI_API_KEY)
+evaluation_workflow = EvaluationWorkflow(Config.OPENAI_API_KEY)
 
 
 @app.get("/")
@@ -353,6 +462,50 @@ async def process_student_message(message: StudentMessage):
         
     except Exception as e:
         print(f"ERROR: {type(e).__name__}: {str(e)}")
+        import traceback
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/chat/{ub_id}/evaluate")
+async def evaluate_chat(ub_id: int):
+    try:
+        session = await xano.get_chat_session(ub_id)
+        block = await xano.get_block(session["block_id"])
+        
+        eval_instructions = block.get("eval_instructions")
+        if not eval_instructions:
+            raise HTTPException(status_code=400, detail="No evaluation instructions configured")
+        
+        workflow_state = await xano.get_workflow_state(ub_id)
+        if not workflow_state:
+            raise HTTPException(status_code=404, detail="No workflow state found")
+        
+        criteria = block.get("eval_crit_json", [])
+        if isinstance(criteria, str):
+            try:
+                criteria = json.loads(criteria)
+            except:
+                criteria = []
+        
+        evaluation_text = await evaluation_workflow.run_evaluation(
+            ub_id=ub_id,
+            workflow_state=workflow_state,
+            eval_instructions=eval_instructions,
+            criteria=criteria
+        )
+        
+        return {
+            "evaluation": evaluation_text,
+            "timestamp": datetime.now().isoformat(),
+            "conversation_length": len(workflow_state.answers),
+            "criteria_count": len(criteria)
+        }
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        print(f"ERROR: {e}")
         import traceback
         traceback.print_exc()
         raise HTTPException(status_code=500, detail=str(e))
