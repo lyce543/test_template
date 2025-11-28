@@ -8,7 +8,7 @@ from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 import httpx
-from agents import Agent, Runner, RunConfig, RunContextWrapper, ModelSettings, function_tool, trace
+from agents import Agent, Runner, RunConfig, RunContextWrapper, ModelSettings, trace
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -75,38 +75,70 @@ class XanoClient:
     
     async def get_workflow_state(self, ub_id: int) -> Optional[WorkflowState]:
         try:
-            response = await self.client.get(f"{self.base_url}/workflow_state/{ub_id}")
+            response = await self.client.get(f"{self.base_url}/get_workflow_state/{ub_id}")
+            print(f"[DEBUG] get_workflow_state status: {response.status_code}")
+            
             if response.status_code == 200:
                 data = response.json()
-                if data:
-                    state_data = data if isinstance(data, dict) else (data[0] if isinstance(data, list) and data else None)
-                    if state_data:
-                        state_data['questions'] = json.loads(state_data['questions']) if isinstance(state_data.get('questions'), str) else state_data.get('questions', [])
-                        state_data['answers'] = json.loads(state_data['answers']) if isinstance(state_data.get('answers'), str) else state_data.get('answers', [])
-                        return WorkflowState(**state_data)
+                print(f"[DEBUG] workflow_state raw data: {data}")
+
+                if isinstance(data, dict) and 'error' in data:
+                    print(f"[DEBUG] No state found in Xano")
+                    return None
+                
+                if not data:
+                    return None
+                
+                state_data = data if isinstance(data, dict) else (data[0] if isinstance(data, list) and data else None)
+                
+                if not state_data:
+                    return None
+                
+                if 'questions' in state_data and isinstance(state_data['questions'], str):
+                    state_data['questions'] = json.loads(state_data['questions'])
+                if 'answers' in state_data and isinstance(state_data['answers'], str):
+                    state_data['answers'] = json.loads(state_data['answers'])
+                
+                print(f"[DEBUG] parsed state: q_index={state_data.get('current_question_index')}, follow_ups={state_data.get('follow_up_count')}")
+                return WorkflowState(**state_data)
+            
+            return None
         except Exception as e:
-            print(f"Error loading workflow state: {e}")
-        return None
+            print(f"[ERROR] get_workflow_state: {e}")
+            return None
     
     async def save_workflow_state(self, state: WorkflowState):
-        data = {
-            "ub_id": state.ub_id,
-            "block_id": state.block_id,
-            "current_question_index": state.current_question_index,
-            "questions": json.dumps(state.questions, ensure_ascii=False),
-            "answers": json.dumps(state.answers, ensure_ascii=False),
-            "follow_up_count": state.follow_up_count,
-            "max_follow_ups": state.max_follow_ups,
-            "status": state.status
-        }
-        response = await self.client.post(f"{self.base_url}/save_workflow_state", json=data)
-        return response.json() if response.status_code in [200, 201] else None
-    
-    async def get_messages(self, ub_id: int) -> List[Dict[str, Any]]:
-        response = await self.client.get(f"{self.base_url}/air", params={"ub_id": ub_id})
-        response.raise_for_status()
-        return response.json()
-    
+        try:
+            # Xano endpoint сам визначить чи робити Add чи Edit через Conditional
+            data = {
+                "ub_id": state.ub_id,
+                "block_id": state.block_id,
+                "current_question_index": state.current_question_index,
+                "questions": state.questions,  # JSON object
+                "answers": state.answers,      # JSON object
+                "follow_up_count": state.follow_up_count,
+                "status": state.status
+            }
+            
+            print(f"[DEBUG] Saving state: ub_id={data['ub_id']}, q_index={data['current_question_index']}, follow_ups={data['follow_up_count']}")
+            
+            response = await self.client.post(f"{self.base_url}/save_workflow_state", json=data)
+            print(f"[DEBUG] save_workflow_state status: {response.status_code}")
+            print(f"[DEBUG] save_workflow_state response: {response.text}")
+            
+            if response.status_code in [200, 201]:
+                result = response.json()
+                print(f"[DEBUG] State saved successfully")
+                return result
+            else:
+                print(f"[ERROR] Failed to save state: {response.text}")
+                return None
+        except Exception as e:
+            print(f"[ERROR] save_workflow_state: {e}")
+            import traceback
+            traceback.print_exc()
+            return None
+        
     async def save_message_pair(self, ub_id: int, user_message: str, ai_response: str, prev_id: Optional[int] = None) -> Dict[str, Any]:
         timestamp = int(datetime.now().timestamp() * 1000)
         message_record = {
@@ -117,7 +149,7 @@ class XanoClient:
             "ai_content": json.dumps([{"text": ai_response, "title": "", "created_at": timestamp}]),
             "prev_id": prev_id if prev_id else 0
         }
-        response = await self.client.post(f"{self.base_url}/add_air", json=message_record)
+        response = await self.client.post(f"{self.base_url}/air", json=message_record)
         return response.json() if response.status_code in [200, 201] else {"id": timestamp}
     
     async def update_chat_status(self, ub_id: int, status: ChatStatus, grade: Optional[str] = None):
@@ -125,9 +157,9 @@ class XanoClient:
         if grade:
             update_data["grade"] = grade
         try:
-            await self.client.post(f"{self.base_url}/update_ub", json=update_data)
+            await self.client.post(f"{self.base_url}/ub/update", json=update_data)
         except Exception as e:
-            print(f"Status update error: {e}")
+            print(f"[ERROR] Status update: {e}")
 
 
 class WorkflowContext:
@@ -211,6 +243,7 @@ Return JSON:
             state = await xano.get_workflow_state(ub_id)
             
             if not state:
+                print(f"[DEBUG] Creating new workflow state for ub_id={ub_id}")
                 state = WorkflowState(
                     ub_id=ub_id,
                     block_id=block["id"],
@@ -221,10 +254,8 @@ Return JSON:
                     status="active"
                 )
                 await xano.save_workflow_state(state)
-            
-            context = WorkflowContext(state=state)
-            
-            if not state.answers or state.answers[-1].get('evaluation', {}).get('complete', False):
+                
+                context = WorkflowContext(state=state)
                 interviewer = self.create_interviewer_agent(context, template.get("model", Config.DEFAULT_MODEL))
                 result = await Runner.run(interviewer, "", context=context)
                 response = result.final_output_as(str)
@@ -235,20 +266,34 @@ Return JSON:
                     "timestamp": datetime.now().isoformat(),
                     "evaluation": {}
                 })
-                state.follow_up_count = 0
                 await xano.save_workflow_state(state)
                 return response
             
-            state.answers[-1]['answer'] = user_message
-            state.answers[-1]['timestamp'] = datetime.now().isoformat()
+            print(f"[DEBUG] Loaded existing state: q_index={state.current_question_index}, follow_ups={state.follow_up_count}")
+            
+            context = WorkflowContext(state=state)
+            
+            if state.answers and not state.answers[-1].get('answer'):
+                state.answers[-1]['answer'] = user_message
+                state.answers[-1]['timestamp'] = datetime.now().isoformat()
+            else:
+                state.answers.append({
+                    "question_index": state.current_question_index,
+                    "answer": user_message,
+                    "timestamp": datetime.now().isoformat(),
+                    "evaluation": {}
+                })
             
             evaluator = self.create_evaluator_agent(context, template.get("model", Config.DEFAULT_MODEL))
             eval_result = await Runner.run(evaluator, "", context=context)
             evaluation = eval_result.final_output.model_dump()
             
+            print(f"[DEBUG] Evaluation result: {evaluation}")
+            
             state.answers[-1]['evaluation'] = evaluation
             
             if evaluation['complete']:
+                print(f"[DEBUG] Answer complete, moving to next question")
                 state.current_question_index += 1
                 state.follow_up_count = 0
                 
@@ -275,6 +320,7 @@ Return JSON:
             
             else:
                 if state.follow_up_count >= state.max_follow_ups:
+                    print(f"[DEBUG] Max follow-ups reached, moving to next question")
                     state.current_question_index += 1
                     state.follow_up_count = 0
                     
@@ -300,12 +346,22 @@ Return JSON:
                     return response
                 
                 else:
+                    print(f"[DEBUG] Answer incomplete, asking follow-up ({state.follow_up_count + 1}/{state.max_follow_ups})")
                     state.follow_up_count += 1
                     await xano.save_workflow_state(state)
                     
                     interviewer = self.create_interviewer_agent(context, template.get("model", Config.DEFAULT_MODEL))
                     result = await Runner.run(interviewer, f"Student answer was incomplete. Ask a follow-up question to clarify.", context=context)
-                    return result.final_output_as(str)
+                    response = result.final_output_as(str)
+                    
+                    state.answers.append({
+                        "question_index": state.current_question_index,
+                        "answer": "",
+                        "timestamp": datetime.now().isoformat(),
+                        "evaluation": {}
+                    })
+                    await xano.save_workflow_state(state)
+                    return response
 
 
 app = FastAPI(title="EdTech AI Platform", version="2.0.0")
@@ -354,14 +410,14 @@ async def process_student_message(message: StudentMessage):
         return AssistantResponse(title="-", text=ai_response, type="interview")
         
     except Exception as e:
-        print(f"ERROR: {type(e).__name__}: {str(e)}")
+        print(f"[ERROR] process_student_message: {type(e).__name__}: {str(e)}")
         import traceback
         traceback.print_exc()
         raise HTTPException(status_code=500, detail=str(e))
 
 
 @app.get("/chat/{ub_id}/state")
-async def get_workflow_state(ub_id: int):
+async def get_workflow_state_endpoint(ub_id: int):
     try:
         state = await xano.get_workflow_state(ub_id)
         if state:
@@ -371,7 +427,7 @@ async def get_workflow_state(ub_id: int):
     except HTTPException:
         raise
     except Exception as e:
-        print(f"ERROR: {e}")
+        print(f"[ERROR] get_workflow_state endpoint: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
 
