@@ -338,53 +338,82 @@ class EvaluationWorkflow:
     def create_evaluation_agent(self, context: EvaluationContext, model: str) -> Agent[EvaluationContext]:
         def agent_instructions(run_context: RunContextWrapper[EvaluationContext], _agent: Agent):
             ctx = run_context.context
+
+            criteria_text = ""
+            for i, crit in enumerate(ctx.criteria):
+                criteria_text += f"\n## Criterion {i+1}"
+                if crit.get('criterion_name'):
+                    criteria_text += f": {crit['criterion_name']}"
+                criteria_text += f"\nMax Points: {crit.get('max_points', 0)}\n"
+                if crit.get('summary_instructions'):
+                    criteria_text += f"Summary Instructions: {crit['summary_instructions']}\n"
+                if crit.get('grading_instructions'):
+                    criteria_text += f"Grading Instructions: {crit['grading_instructions']}\n"
+                criteria_text += "\n"
+
+            conversation_text = ""
+            for i, ans in enumerate(ctx.workflow_state.answers):
+                q_index = ans.get('question_index', i)
+                
+                if q_index < len(ctx.workflow_state.questions):
+                    question = ctx.workflow_state.questions[q_index]
+                    
+                    conversation_text += f"\n{'='*60}\n"
+                    conversation_text += f"Exchange {i+1}:\n"
+                    conversation_text += f"{'='*60}\n\n"
+                    conversation_text += f"**Question:** {question.get('question', 'N/A')}\n"
+                    conversation_text += f"**Expected key concepts:** {question.get('key_concepts', 'N/A')}\n\n"
+                    conversation_text += f"**Student answer:** {ans.get('answer', 'No answer provided')}\n\n"
+                    
+                    evaluation = ans.get('evaluation', {})
+                    if evaluation:
+                        conversation_text += f"**Workflow evaluation:**\n"
+                        conversation_text += f"  - Answer was complete: {evaluation.get('complete', False)}\n"
+                        if evaluation.get('missing_concepts'):
+                            conversation_text += f"  - Missing concepts: {', '.join(evaluation.get('missing_concepts', []))}\n"
+                        if evaluation.get('needs_clarification'):
+                            conversation_text += f"  - Needed clarification: {evaluation.get('needs_clarification', False)}\n"
+                    
+                    conversation_text += "\n"
             
-            criteria_text = "\n\n".join([
-                f"## Criterion {i+1}: {crit.get('criterion_name', f'Criterion {i+1}')}\n"
-                f"Max Points: {crit.get('max_points', 0)}\n"
-                f"Summary: {crit.get('summary_instructions', '')}\n"
-                f"Grading: {crit.get('grading_instructions', '')}"
-                for i, crit in enumerate(ctx.criteria)
-            ])
-            
-            questions_text = "\n".join([
-                f"Question {i+1}: {q.get('question', '')}\n"
-                f"Key concepts: {q.get('key_concepts', '')}"
-                for i, q in enumerate(ctx.workflow_state.questions)
-            ])
-            
-            answers_text = "\n".join([
-                f"Answer {i+1}: {ans.get('answer', '')}\n"
-                f"Evaluation: {ans.get('evaluation', {})}"
-                for i, ans in enumerate(ctx.workflow_state.answers)
-            ])
-            
-            return f"""{ctx.eval_instructions}
+            return f"""You are an evaluation assistant for an educational platform.
 
-# Questions and Key Concepts:
-{questions_text}
+    {ctx.eval_instructions}
 
-# Student Answers:
-{answers_text}
+    # Conversation History
+    {conversation_text}
 
-# Evaluation Criteria:
-{criteria_text}
+    # Evaluation Criteria
+    {criteria_text}
 
-Evaluate the student's performance according to the criteria. Provide detailed assessment for each criterion and calculate the final grade.
+    # Your Task
 
-Format your response as:
-# Evaluation
+    Evaluate the student's performance according to the provided criteria.
 
-## Criterion 1
-[Assessment]
-Grade: X/Y
-Comment: [Explanation]
+    For each criterion:
+    1. Review the student's answers and the workflow evaluation results
+    2. Assess how well they met the criterion
+    3. Assign a grade (0 to max_points for that criterion)
+    4. Provide clear reasoning
 
-## Criterion 2
-...
+    Format your response as:
 
-# Final Grade: X/Y
-[Overall assessment]"""
+    # Evaluation Report
+
+    ## Criterion 1: [Name]
+    **Assessment:** [Detailed assessment based on answers]
+    **Grade:** X/Y points
+    **Reasoning:** [Why this grade was assigned]
+
+    ## Criterion 2: [Name]
+    **Assessment:** [Detailed assessment]
+    **Grade:** X/Y points
+    **Reasoning:** [Explanation]
+
+    # Summary
+    **Total Score:** X/Y points
+    **Overall Performance:** [Brief summary]
+    **Recommendations:** [Optional suggestions for improvement]"""
         
         return Agent[EvaluationContext](
             name="EvaluationAgent",
@@ -402,14 +431,35 @@ Comment: [Explanation]
         model: str = Config.DEFAULT_MODEL
     ) -> str:
         with trace(f"Evaluation-{ub_id}"):
+            print(f"[DEBUG] Starting evaluation for ub_id={ub_id}")
+            print(f"  Workflow state: {len(workflow_state.answers)} answers")
+            print(f"  Criteria: {len(criteria)}")
+            
             context = EvaluationContext(
                 workflow_state=workflow_state,
                 eval_instructions=eval_instructions,
                 criteria=criteria
             )
             
+            print(f"[DEBUG] Context created")
+            
             agent = self.create_evaluation_agent(context, model)
-            result = await Runner.run(agent, "", context=context)
+            
+            print(f"[DEBUG] Agent created, running evaluation...")
+            
+            result = await Runner.run(
+                agent,
+                "",
+                context=context,
+                run_config=RunConfig(
+                    trace_metadata={
+                        "__trace_source__": "edtech-evaluation",
+                        "ub_id": ub_id
+                    }
+                )
+            )
+            
+            print(f"[DEBUG] Evaluation complete")
             
             return result.final_output_as(str)
 
