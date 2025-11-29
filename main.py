@@ -118,14 +118,23 @@ class XanoClient:
         response = await self.client.post(f"{self.base_url}/add_air", json=message_record)
         return response.json() if response.status_code in [200, 201] else {"id": timestamp}
     
-    async def update_chat_status(self, ub_id: int, status: ChatStatus, grade: Optional[str] = None):
-        update_data = {"ub_id": int(ub_id), "status": status.value}
-        if grade:
+    async def update_chat_status(self, ub_id: int, status: Optional[ChatStatus] = None, grade: Optional[str] = None, last_air_id: Optional[int] = None):
+        update_data = {"ub_id": int(ub_id)}
+        
+        if status:
+            update_data["status"] = status.value
+        if grade is not None:
             update_data["grade"] = grade
+        if last_air_id:
+            update_data["last_air_id"] = int(last_air_id)
+        
         try:
-            await self.client.post(f"{self.base_url}/update_ub", json=update_data)
+            response = await self.client.post(f"{self.base_url}/update_ub", json=update_data)
+            if response.status_code in [200, 201]:
+                return response.json()
         except Exception as e:
             print(f"Status update error: {e}")
+        return None
 
 
 class WorkflowContext:
@@ -242,7 +251,7 @@ Return JSON:
             if state.current_question_index >= len(state.questions):
                 state.status = "finished"
                 await xano.save_workflow_state(state)
-                await xano.update_chat_status(ub_id, ChatStatus.FINISHED)
+                await xano.update_chat_status(ub_id, status=ChatStatus.FINISHED)
                 return "Вітаю! Ви відповіли на всі питання. Іспит завершено."
             
             context = WorkflowContext(state=state)
@@ -278,7 +287,7 @@ Return JSON:
                 if state.current_question_index >= len(state.questions):
                     state.status = "finished"
                     await xano.save_workflow_state(state)
-                    await xano.update_chat_status(ub_id, ChatStatus.FINISHED)
+                    await xano.update_chat_status(ub_id, status=ChatStatus.FINISHED)
                     return "Вітаю! Ви відповіли на всі питання. Іспит завершено."
                 
                 await xano.save_workflow_state(state)
@@ -304,7 +313,7 @@ Return JSON:
                     if state.current_question_index >= len(state.questions):
                         state.status = "finished"
                         await xano.save_workflow_state(state)
-                        await xano.update_chat_status(ub_id, ChatStatus.FINISHED)
+                        await xano.update_chat_status(ub_id, status=ChatStatus.FINISHED)
                         return "Іспит завершено."
                     
                     await xano.save_workflow_state(state)
@@ -378,42 +387,42 @@ class EvaluationWorkflow:
             
             return f"""You are an evaluation assistant for an educational platform.
 
-    {ctx.eval_instructions}
+{ctx.eval_instructions}
 
-    # Conversation History
-    {conversation_text}
+# Conversation History
+{conversation_text}
 
-    # Evaluation Criteria
-    {criteria_text}
+# Evaluation Criteria
+{criteria_text}
 
-    # Your Task
+# Your Task
 
-    Evaluate the student's performance according to the provided criteria.
+Evaluate the student's performance according to the provided criteria.
 
-    For each criterion:
-    1. Review the student's answers and the workflow evaluation results
-    2. Assess how well they met the criterion
-    3. Assign a grade (0 to max_points for that criterion)
-    4. Provide clear reasoning
+For each criterion:
+1. Review the student's answers and the workflow evaluation results
+2. Assess how well they met the criterion
+3. Assign a grade (0 to max_points for that criterion)
+4. Provide clear reasoning
 
-    Format your response as:
+Format your response as:
 
-    # Evaluation Report
+# Evaluation Report
 
-    ## Criterion 1: [Name]
-    **Assessment:** [Detailed assessment based on answers]
-    **Grade:** X/Y points
-    **Reasoning:** [Why this grade was assigned]
+## Criterion 1: [Name]
+**Assessment:** [Detailed assessment based on answers]
+**Grade:** X/Y points
+**Reasoning:** [Why this grade was assigned]
 
-    ## Criterion 2: [Name]
-    **Assessment:** [Detailed assessment]
-    **Grade:** X/Y points
-    **Reasoning:** [Explanation]
+## Criterion 2: [Name]
+**Assessment:** [Detailed assessment]
+**Grade:** X/Y points
+**Reasoning:** [Explanation]
 
-    # Summary
-    **Total Score:** X/Y points
-    **Overall Performance:** [Brief summary]
-    **Recommendations:** [Optional suggestions for improvement]"""
+# Summary
+**Total Score:** X/Y points
+**Overall Performance:** [Brief summary]
+**Recommendations:** [Optional suggestions for improvement]"""
         
         return Agent[EvaluationContext](
             name="EvaluationAgent",
@@ -431,21 +440,13 @@ class EvaluationWorkflow:
         model: str = Config.DEFAULT_MODEL
     ) -> str:
         with trace(f"Evaluation-{ub_id}"):
-            print(f"[DEBUG] Starting evaluation for ub_id={ub_id}")
-            print(f"  Workflow state: {len(workflow_state.answers)} answers")
-            print(f"  Criteria: {len(criteria)}")
-            
             context = EvaluationContext(
                 workflow_state=workflow_state,
                 eval_instructions=eval_instructions,
                 criteria=criteria
             )
             
-            print(f"[DEBUG] Context created")
-            
             agent = self.create_evaluation_agent(context, model)
-            
-            print(f"[DEBUG] Agent created, running evaluation...")
             
             result = await Runner.run(
                 agent,
@@ -458,8 +459,6 @@ class EvaluationWorkflow:
                     }
                 )
             )
-            
-            print(f"[DEBUG] Evaluation complete")
             
             return result.final_output_as(str)
 
@@ -521,6 +520,16 @@ async def process_student_message(message: StudentMessage):
 async def evaluate_chat(ub_id: int):
     try:
         session = await xano.get_chat_session(ub_id)
+        
+        if session.get('grade'):
+            return {
+                "evaluation": session['grade'],
+                "timestamp": datetime.now().isoformat(),
+                "conversation_length": 0,
+                "criteria_count": 0,
+                "cached": True
+            }
+        
         block = await xano.get_block(session["block_id"])
         
         eval_instructions = block.get("eval_instructions")
@@ -545,11 +554,14 @@ async def evaluate_chat(ub_id: int):
             criteria=criteria
         )
         
+        await xano.update_chat_status(ub_id, grade=evaluation_text)
+        
         return {
             "evaluation": evaluation_text,
             "timestamp": datetime.now().isoformat(),
             "conversation_length": len(workflow_state.answers),
-            "criteria_count": len(criteria)
+            "criteria_count": len(criteria),
+            "cached": False
         }
         
     except HTTPException:
