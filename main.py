@@ -166,26 +166,40 @@ class ExaminationWorkflow:
                 return "The exam is complete. Thank the student."
             
             current_q = ctx.state.questions[ctx.state.current_question_index]
+            last_answer = ctx.state.answers[-1] if ctx.state.answers else {}
+            evaluation = last_answer.get('evaluation', {})
             
-            return f"""You are an examiner conducting an oral exam.
+            is_followup = evaluation.get('needs_clarification', False) and ctx.state.follow_up_count > 0
+            
+            if is_followup:
+                return f"""You are conducting an oral exam. The student gave a partial answer.
+
+Question: {current_q['question']}
+Student's previous answer: {last_answer.get('answer', '')}
+
+Ask a NATURAL follow-up question that:
+- Encourages the student to elaborate or clarify
+- Does NOT reveal the correct answer or key concepts
+- Uses open-ended phrasing like:
+  * "Чи можете розповісти більше про..."
+  * "Що ще ви знаєте про..."
+  * "Уточніть, будь ласка..."
+
+Speak in Ukrainian. Be supportive but neutral."""
+            else:
+                return f"""You are an examiner conducting an oral exam.
 
 Current question: {current_q['question']}
-Expected key concepts: {current_q['key_concepts']}
 
-Rules:
-- Ask the question clearly in Ukrainian
-- Do NOT reveal the key concepts
-- Do NOT give correct answers
-- If answer is incomplete, ask open-ended follow-up (max {ctx.state.max_follow_ups})
-- Be neutral and professional
-
-Ask the question now."""
+Ask this question clearly and directly in Ukrainian.
+Do NOT give hints or reveal key concepts.
+Be professional and neutral."""
         
         return Agent[WorkflowContext](
             name="Interviewer",
             instructions=agent_instructions,
             model=model,
-            model_settings=ModelSettings(temperature=1, top_p=1, max_tokens=1024)
+            model_settings=ModelSettings(temperature=0.7, top_p=1, max_tokens=512)
         )
     
     def create_evaluator_agent(self, context: WorkflowContext, model: str) -> Agent[WorkflowContext]:
@@ -194,23 +208,41 @@ Ask the question now."""
             current_q = ctx.state.questions[ctx.state.current_question_index]
             last_answer = ctx.state.answers[-1] if ctx.state.answers else {}
             
-            return f"""You are an evaluator.
+            return f"""You are an evaluator for an oral examination.
 
-Question: {current_q['question']}
-Key concepts: {current_q['key_concepts']}
-Student answer: {last_answer.get('answer', '')}
+QUESTION: {current_q['question']}
+KEY CONCEPTS: {current_q['key_concepts']}
+STUDENT ANSWER: {last_answer.get('answer', '')}
 
-Evaluate:
-1. Does answer contain ALL key concepts? (yes/no)
-2. If no, which concepts are missing?
-3. Should we ask follow-up or move next?
+EVALUATION RULES:
+1. Check if the answer SEMANTICALLY covers the key concepts
+2. Accept synonyms, paraphrases, and detailed explanations
+3. Focus on MEANING, not exact wording
+4. If answer is clearly wrong or irrelevant → complete=false, needs_clarification=false
+5. If answer partially addresses the topic → complete=false, needs_clarification=true
+6. If answer fully covers the key concept (even with different words) → complete=true
+
+EXAMPLES:
+- Key concept: "Ембединг"
+  ✅ "векторне представлення слів" → complete=true
+  ✅ "числове представлення слова" → complete=true
+  ❌ "не знаю" → complete=false, needs_clarification=false
+
+- Key concept: "Позиційне кодування"
+  ✅ "механізм що додає інформацію про порядок слів" → complete=true
+  ✅ "вектори які вказують місце слова в реченні" → complete=true
+  ⚠️  "кодування" → complete=false, needs_clarification=true (too vague)
+  ❌ "привіт" → complete=false, needs_clarification=false
 
 Return JSON:
 {{
   "complete": true/false,
-  "missing_concepts": [...],
+  "missing_concepts": ["concept1", ...],
   "needs_clarification": true/false
-}}"""
+}}
+
+Current follow-up count: {ctx.state.follow_up_count}/{ctx.state.max_follow_ups}
+If follow_up_count >= max, set needs_clarification=false even if incomplete."""
         
         class EvalOutput(BaseModel):
             complete: bool
@@ -222,7 +254,7 @@ Return JSON:
             instructions=agent_instructions,
             model=model,
             output_type=EvalOutput,
-            model_settings=ModelSettings(temperature=0.3, max_tokens=512)
+            model_settings=ModelSettings(temperature=0.2, max_tokens=512)
         )
     
     async def run_workflow(self, block: Dict, template: Dict, user_message: str, ub_id: int, xano: XanoClient) -> str:
